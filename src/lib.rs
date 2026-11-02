@@ -12,6 +12,9 @@
 //! - [`Connection`] is the lower layer: send a [`Request`], receive an
 //!   [`Event`].
 //!
+//! Reverse engineered for interoperability under DMCA §1201(f). No licensing is
+//! circumvented, no proprietary code is reproduced, and no features are unlocked.
+//!
 //! # Example
 //!
 //! ```no_run

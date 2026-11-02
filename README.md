@@ -1,11 +1,13 @@
 # 3putt
 
 [![CI](https://github.com/divotmaker/3putt/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/3putt/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/threeputt.svg)](https://crates.io/crates/threeputt)
+[![docs.rs](https://docs.rs/threeputt/badge.svg)](https://docs.rs/threeputt)
 
 ## Disclaimer
 
 This project is not affiliated with or endorsed by Invant Inc.
-ExPutt is a trademark of its respective owner.
+ExPutt and ExPutt RG are trademarks of Invant Inc.
 
 ## Description
 
@@ -27,6 +29,69 @@ simulator).
 
 Plain blocking `std::net` sockets and threads. No async runtime, no ZeroMQ
 library.
+
+## Legal Basis — DMCA Section 1201(f)
+
+This project is an exercise of the interoperability exception under
+[17 U.S.C. § 1201(f)](https://www.law.cornell.edu/uscode/text/17/1201):
+
+> (f) Reverse Engineering.—
+>
+> (1) Notwithstanding the provisions of subsection (a)(1)(A), a person who has
+> lawfully obtained the right to use a copy of a computer program may
+> circumvent a technological measure that effectively controls access to a
+> particular portion of that program for the sole purpose of identifying and
+> analyzing those elements of the program that are necessary to achieve
+> interoperability of an independently created computer program with other
+> programs, and that have not previously been readily made available to the
+> person engaging in the circumvention, to the extent any such acts of
+> identification and analysis do not constitute infringement under this title.
+>
+> (2) Notwithstanding the provisions of subsections (a)(2) and (b), a person
+> may develop and employ technological means to circumvent a technological
+> measure, or to circumvent protection afforded by a technological measure, in
+> order to enable the identification and analysis described in paragraph (1),
+> or for the purpose of enabling interoperability of an independently created
+> computer program with other programs, if such means are necessary to achieve
+> such interoperability, to the extent that doing so does not constitute
+> infringement under this title.
+
+The ExPutt RG uses a proprietary protocol over WiFi to communicate putt data
+(ball speed, launch direction, putter path and face angle, etc.) to its mobile
+app. Invant does not publish this protocol or provide an SDK for third-party
+integration. The protocol was worked out from WiFi traffic between the
+researcher's own lawfully purchased device and the official ExPutt app, and
+from analysis of that app, solely to enable interoperability with third-party
+golf simulation software.
+
+No Invant code is reproduced here; the protocol is described and implemented in
+our own words and names. No access controls were circumvented — the device
+accepts unencrypted connections on the local network and its session handshake
+carries no secret, and all traffic was captured from the researcher's own
+hardware.
+
+## Acceptable Use
+
+This project exists solely to enable interoperability between the ExPutt RG
+and third-party golf simulation software.
+
+**It must not be used to:**
+
+- Circumvent licensing or subscription requirements on Invant products
+- Unlock paid features without purchase
+- Bypass any access controls on Invant software or services
+
+Issues or discussions proposing circumvention of licensing will be closed and
+the user blocked.
+
+## License
+
+Licensed under either of:
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+
+at your option.
 
 ## Status
 
@@ -125,19 +190,3 @@ Unrecognised packets are never errors.
 The `testing` feature adds `threeputt::testing::MockDevice`, an in-process
 mock device on a local TCP port, plus sample putt results, for testing code
 built on this crate without hardware.
-
-## Acceptable use
-
-This project exists solely to let ExPutt RG owners use their device with
-third-party software. It does not unlock features, bypass licensing or access
-controls, or reproduce any vendor code; the protocol is implemented in our own
-words and names.
-
-## License
-
-Licensed under either of:
-
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-
-at your option.
