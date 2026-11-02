@@ -1,0 +1,2 @@
+# Product and protocol names written in prose, not code.
+doc-valid-idents = ["ExPutt", "ZeroMQ", "WiFi", ".."]

@@ -1,0 +1,39 @@
+[package]
+name = "threeputt"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+description = "Client library for the ExPutt RG putting device over WiFi"
+repository = "https://github.com/divotmaker/3putt"
+readme = "README.md"
+keywords = ["golf", "putting", "exputt", "zeromq"]
+categories = ["network-programming", "hardware-support"]
+exclude = ["CLAUDE.md", ".github/", "rust-toolchain.toml"]
+
+[lib]
+name = "threeputt"
+
+[features]
+# Test support: `threeputt::testing` (an in-process mock device speaking the
+# device side of the protocol, sample result strings). Off by default.
+testing = []
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# SO_REUSEADDR on the discovery socket, which std cannot set before bind.
+socket2 = "0.6"
+
+[dev-dependencies]
+# Ctrl-C handling in examples/monitor.rs.
+ctrlc = "3"
+
+[[test]]
+name = "session"
+required-features = ["testing"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
