@@ -77,7 +77,9 @@ impl Default for SessionOptions {
 ///
 /// [`close`](Self::close) (or dropping the session) ends measuring, tells the
 /// device the client is leaving, and closes the socket. When the device drops
-/// the connection, the event channel disconnects.
+/// the connection, the event channel disconnects. So it does when a keepalive
+/// cannot be sent: the socket is shut down, the reader thread ends, and
+/// [`is_connected`](Self::is_connected) turns false.
 #[derive(Debug)]
 pub struct Session {
     writer: PacketWriter,
@@ -397,6 +399,10 @@ fn keepalive_loop(writer: &PacketWriter, stop: &Receiver<()>, interval: Duration
         match stop.recv_timeout(interval) {
             Err(RecvTimeoutError::Timeout) => {
                 if writer.send(Request::Alive).is_err() {
+                    // The connection is unusable. Shutting it down ends the
+                    // reader thread, which a device that has vanished would
+                    // otherwise leave blocked in a read.
+                    let _ = writer.shutdown();
                     return;
                 }
             }
@@ -407,13 +413,58 @@ fn keepalive_loop(writer: &PacketWriter, stop: &Receiver<()>, interval: Duration
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::io::Write;
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
     use std::time::Instant;
 
     use super::*;
     use crate::testing::{MockConfig, MockDevice, ReceivedPacket};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A failed keepalive write shuts the socket down, so a reader blocked in
+    /// a read (the device is silent and has not closed) ends and the event
+    /// channel disconnects.
+    #[test]
+    fn a_failed_keepalive_ends_the_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, released) = mpsc::channel::<()>();
+        let device = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&crate::zmtp::greeting(crate::zmtp::SOCKET_ROUTER))
+                .unwrap();
+            // Holds the connection open, sending nothing and ignoring what
+            // arrives (the client's FIN included), until released.
+            let _ = released.recv();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        // Writes on this handle fail from now on; reads are unaffected.
+        let breaker = stream.try_clone().unwrap();
+        let (reader, writer) = Connection::from_stream(stream).unwrap().split();
+        breaker.shutdown(Shutdown::Write).unwrap();
+
+        let (event_tx, events) = mpsc::channel();
+        let mat_waiter = Mutex::new(None);
+        let read = thread::spawn(move || read_loop(reader, &event_tx, &mat_waiter, false));
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let keepalive = thread::spawn({
+            let writer = writer.clone();
+            move || keepalive_loop(&writer, &stop_rx, Duration::from_millis(20))
+        });
+
+        assert_eq!(
+            events.recv_timeout(WAIT),
+            Err(RecvTimeoutError::Disconnected),
+            "the reader ends once the keepalive fails"
+        );
+        read.join().unwrap();
+        keepalive.join().unwrap();
+        drop(release);
+        device.join().unwrap();
+    }
 
     fn non_alive(packets: &[ReceivedPacket]) -> Vec<String> {
         packets
