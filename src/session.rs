@@ -89,7 +89,7 @@ pub struct Session {
     reader: Option<JoinHandle<()>>,
     /// Cleared by the reader thread before the event channel disconnects.
     receiving: Arc<AtomicBool>,
-    /// Signalled by the reader thread on the next [`Event::MatFound`], and
+    /// Signaled by the reader thread on the next [`Event::MatFound`], and
     /// dropped when the reader thread ends.
     mat_waiter: Arc<Mutex<Option<Sender<()>>>>,
     mat_timeout: Duration,
@@ -315,7 +315,7 @@ impl Session {
         }
     }
 
-    /// A receiver signalled on the next [`Event::MatFound`]. It disconnects
+    /// A receiver signaled on the next [`Event::MatFound`]. It disconnects
     /// when the reader thread ends or the session closes.
     fn await_mat_found(&self) -> Receiver<()> {
         let (tx, rx) = mpsc::channel();

@@ -167,7 +167,7 @@ the same putt. All 16 values are always available in `raw`.
 | camera image | `CameraFrame` (JPEG bytes) |
 | anything else | `Unknown { packet_id, comment }` |
 
-Unrecognised packets are never errors.
+Unrecognized packets are never errors.
 
 ## Protocol overview
 

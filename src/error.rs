@@ -4,7 +4,7 @@ use std::io;
 
 /// Everything that can go wrong talking to the device.
 ///
-/// Unrecognised or malformed packets from the device are never errors: they
+/// Unrecognized or malformed packets from the device are never errors: they
 /// arrive as [`Event::Unknown`](crate::Event::Unknown).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

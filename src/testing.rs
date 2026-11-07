@@ -71,7 +71,7 @@ pub fn fake_jpeg(len: usize) -> (Vec<u8>, String) {
     (jpeg, text)
 }
 
-/// Behaviour of a [`MockDevice`].
+/// Behavior of a [`MockDevice`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockConfig {
     /// Reply `N_OK` to `N_VERIFY_ID` and `N_REQ_CONNECT`. Default on.
