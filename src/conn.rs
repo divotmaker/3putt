@@ -11,6 +11,38 @@ use crate::event::Event;
 use crate::packet::Request;
 use crate::zmtp::{self, FrameReader};
 
+/// Which way a message crossed the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// From the device.
+    Rx,
+    /// To the device.
+    Tx,
+}
+
+/// Sees every message body as it crosses the socket, on the thread that
+/// moves it: received bodies before they are parsed (camera frames
+/// included), sent bodies once written.
+pub(crate) type Tap = Arc<dyn Fn(Direction, &[u8]) + Send + Sync>;
+
+/// An optional [`Tap`], printable.
+#[derive(Clone, Default)]
+struct TapSlot(Option<Tap>);
+
+impl TapSlot {
+    fn see(&self, dir: Direction, body: &[u8]) {
+        if let Some(tap) = &self.0 {
+            tap(dir, body);
+        }
+    }
+}
+
+impl std::fmt::Debug for TapSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Tap" } else { "None" })
+    }
+}
+
 /// Write timeout on the protocol socket, so a dead peer cannot block a send
 /// forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,9 +93,13 @@ impl Connection {
             .read_greeting()
             .map_err(|e| timeout_from(e, "the device's greeting"))?;
         Ok(Self {
-            reader: EventReader { frames },
+            reader: EventReader {
+                frames,
+                tap: TapSlot::default(),
+            },
             writer: PacketWriter {
                 stream: Arc::new(Mutex::new(write_half)),
+                tap: TapSlot::default(),
             },
         })
     }
@@ -161,6 +197,7 @@ impl Connection {
 #[derive(Debug)]
 pub struct EventReader {
     frames: FrameReader<TcpStream>,
+    tap: TapSlot,
 }
 
 impl EventReader {
@@ -181,10 +218,16 @@ impl EventReader {
                 .frames
                 .read_message()
                 .map_err(|e| timeout_from(e, "an event"))?;
+            self.tap.see(Direction::Rx, &body);
             if let Some(event) = Event::parse_filtered(&body, frames) {
                 return Ok(event);
             }
         }
+    }
+
+    /// Show every message read from now on to `tap`.
+    pub(crate) fn set_tap(&mut self, tap: Tap) {
+        self.tap = TapSlot(Some(tap));
     }
 }
 
@@ -193,6 +236,7 @@ impl EventReader {
 #[derive(Debug, Clone)]
 pub struct PacketWriter {
     stream: Arc<Mutex<TcpStream>>,
+    tap: TapSlot,
 }
 
 impl PacketWriter {
@@ -202,11 +246,21 @@ impl PacketWriter {
     ///
     /// Socket errors, [`Error::Poisoned`].
     pub fn send(&self, request: Request) -> Result<()> {
-        let frame = zmtp::encode_frame(request.to_json().as_bytes());
-        let mut stream = self.stream.lock().map_err(|_| Error::Poisoned)?;
-        stream.write_all(&frame)?;
-        stream.flush()?;
+        let body = request.to_json();
+        let frame = zmtp::encode_frame(body.as_bytes());
+        {
+            let mut stream = self.stream.lock().map_err(|_| Error::Poisoned)?;
+            stream.write_all(&frame)?;
+            stream.flush()?;
+        }
+        self.tap.see(Direction::Tx, body.as_bytes());
         Ok(())
+    }
+
+    /// Show every message sent from now on, through this writer and the
+    /// clones made after this call, to `tap`.
+    pub(crate) fn set_tap(&mut self, tap: Tap) {
+        self.tap = TapSlot(Some(tap));
     }
 
     /// Shut down both directions of the socket. A thread blocked in

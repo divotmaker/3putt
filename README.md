@@ -134,6 +134,68 @@ the mat (`SessionOptions::camera`; without it the session still starts and
 stops the stream but drops the frames). The images are upside down; rotate
 them 180° to view. Ctrl-C ends the session cleanly.
 
+## Features
+
+| Feature | Adds |
+|---|---|
+| `net` (default) | `discover` (the UDP beacon socket, via `socket2`); a build with `default-features = false` that calls `discover` turns `net` on |
+| `config` | `threeputt::config::Config`, the driver's settings, with no network code: it builds for `wasm32-unknown-unknown` with `--no-default-features --features config` |
+| `driver` | `threeputt::driver::ExPutt`, a [flightrelay](https://crates.io/crates/flightrelay) `DeviceDriver` |
+| `frp` | the `threeputt-frp` binary |
+| `testing` | `threeputt::testing::MockDevice`, and test timings for the driver |
+
+## FRP driver and `threeputt-frp` (beta)
+
+`threeputt::driver::ExPutt` serves the device to any host of flightrelay's
+`DeviceDriver` contract, and `threeputt-frp` is that driver as a standalone
+[Flight Relay Protocol](https://github.com/flightrelay/spec) (FRP 0.2.0)
+device: it listens for FRP controllers (or dials one) and sends each putt as
+a shot.
+
+```sh
+cargo install threeputt --features frp
+threeputt-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>] \
+              [--set <key>=<value>]... [--log <info|debug|trace>] [--help]
+```
+
+- `--target`: an address to listen on (default `0.0.0.0:5880`), or a `ws://`
+  URL to dial.
+- `--set address=192.168.1.40`: the device's IP address. Without it the
+  device is found by its discovery beacon. `--config` takes a TOML file with
+  the same keys (`address = "192.168.1.40"`).
+- `--help` lists every config key with its default.
+
+Ctrl-C closes the session (the device is told the client is leaving) and
+exits 0. An invalid value exits 2.
+
+What a controller receives:
+
+- `device_telemetry` with model `ExPutt RG`, `source` `measured`, the device
+  software version as `firmware` when the device was discovered, and the
+  keys `ready` and `device_state` (`finding mat`, `mat found`, `ready`,
+  `ball struck`).
+- Per putt: `shot_trigger` (with the strike time when the device reported
+  the strike), `launch` with ball speed and launch direction (no vertical
+  launch and no spin: the device measures neither), `club_path` with putter
+  path and face angle when the putter was tracked, and `shot_finished`.
+- A controller's `set_detection_mode` with a hand starts a new round with
+  that hand; its mode and club do not apply (the device only measures putts).
+- `raw_frame`s, for a controller that asks for them: each message as JSON
+  text, labeled with its name. Camera images and unrecognized messages are
+  never sent.
+
+The driver gives a device that stops answering time to recover: a session may
+be silent for 90 s (120 s after a strike) and `ready` is false from 10 s of
+silence; after a silent device the next attempt waits at least 15 s; mat
+searches (a hand change, Find mat) are at least 10 s apart, with requests in
+between folded into one. After two minutes of attempts the device accepts but
+never answers, one alert says so and the per-attempt alerts stop until a
+session succeeds.
+
+A stop during a session start can take up to 18 s: the connect, greeting,
+handshake and mat search can't be cut short (3 s, 3 s, 2 × 3 s and 5 s, plus a
+second to close).
+
 ## Putt result
 
 Each `PuttResult` event carries 16 values. A value the device did not measure

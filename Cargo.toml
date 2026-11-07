@@ -15,9 +15,21 @@ exclude = ["CLAUDE.md", ".github/", "rust-toolchain.toml"]
 name = "threeputt"
 
 [features]
+default = ["net"]
+# Device discovery (`discover`): the UDP beacon socket, which needs `socket2`.
+# Without it the crate builds for targets with no sockets, such as
+# `wasm32-unknown-unknown`, for the `config` feature.
+net = ["dep:socket2"]
 # Test support: `threeputt::testing` (an in-process mock device speaking the
-# device side of the protocol, sample result strings). Off by default.
+# device side of the protocol, sample result strings), and the driver's
+# `Tuning`. Off by default.
 testing = []
+# `threeputt::config`: the driver's settings, with no network dependency.
+config = ["dep:flightrelay", "flightrelay/config"]
+# `threeputt::driver`: the flightrelay `DeviceDriver` for the ExPutt RG.
+driver = ["config", "net", "flightrelay/driver"]
+# The `threeputt-frp` binary: the driver served to FRP controllers.
+frp = ["driver", "flightrelay/server", "flightrelay/main"]
 
 [dependencies]
 thiserror = "2"
@@ -25,7 +37,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 # SO_REUSEADDR on the discovery socket, which std cannot set before bind.
-socket2 = "0.6"
+socket2 = { version = "0.6", optional = true }
+# The FRP types, driver contract and server (features `config`, `driver`, `frp`).
+flightrelay = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]
 # Ctrl-C handling in examples/monitor.rs.
@@ -34,6 +48,14 @@ ctrlc = "3"
 [[test]]
 name = "session"
 required-features = ["testing"]
+
+[[bin]]
+name = "threeputt-frp"
+required-features = ["frp"]
+
+[[example]]
+name = "monitor"
+required-features = ["net"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::beacon::DEVICE_PORT;
-use crate::conn::{Connection, EventReader, PacketWriter};
+use crate::conn::{Connection, EventReader, PacketWriter, Tap};
 use crate::error::Result;
 use crate::event::Event;
 use crate::packet::{Hand, Request};
@@ -125,10 +125,25 @@ impl Session {
     /// [`Error::Greeting`](crate::Error::Greeting),
     /// [`Error::Closed`](crate::Error::Closed).
     pub fn start(ip: IpAddr, options: &SessionOptions) -> Result<Self> {
+        Self::start_with(ip, options, None)
+    }
+
+    /// [`start`](Self::start), showing every message after the handshake
+    /// to `tap`.
+    #[cfg(feature = "driver")]
+    pub(crate) fn start_tapped(ip: IpAddr, options: &SessionOptions, tap: Tap) -> Result<Self> {
+        Self::start_with(ip, options, Some(tap))
+    }
+
+    fn start_with(ip: IpAddr, options: &SessionOptions, tap: Option<Tap>) -> Result<Self> {
         let addr = SocketAddr::new(ip, options.port);
         let mut conn = Connection::connect(addr, options.connect_timeout)?;
         conn.handshake(options.reply_timeout)?;
-        let (reader, writer) = conn.split();
+        let (mut reader, mut writer) = conn.split();
+        if let Some(tap) = tap {
+            reader.set_tap(Arc::clone(&tap));
+            writer.set_tap(tap);
+        }
 
         let (event_tx, events) = mpsc::channel();
         let mat_waiter = Arc::new(Mutex::new(None));

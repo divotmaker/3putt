@@ -10,10 +10,14 @@
 //!  "_appVersion":"1.21.2176","_autoReconnectFlag":false,"_appLanguage":2}
 //! ```
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "net")]
+use std::net::{Ipv4Addr, UdpSocket};
+#[cfg(feature = "net")]
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+#[cfg(feature = "net")]
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::error::{Error, Result};
@@ -102,40 +106,70 @@ struct Wire {
 /// valid one. Datagrams that are not beacons are skipped.
 ///
 /// The socket is bound to `0.0.0.0:9999` with `SO_REUSEADDR`, so other
-/// listeners on the same port do not block discovery.
+/// listeners on the same port do not block discovery. Requires the `net`
+/// feature (on by default).
 ///
 /// # Errors
 ///
 /// [`Error::Timeout`] if no beacon arrives in time; socket errors.
+#[cfg(feature = "net")]
 pub fn discover(timeout: Duration) -> Result<Beacon> {
     discover_on(DISCOVERY_PORT, timeout)
 }
 
+#[cfg(feature = "net")]
 pub(crate) fn discover_on(port: u16, timeout: Duration) -> Result<Beacon> {
-    let socket = bind_reusable(port)?;
-    let deadline = Instant::now() + timeout;
-    let mut buf = [0u8; 2048];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::Timeout("the device's discovery broadcast"));
-        }
-        socket.set_read_timeout(Some(remaining))?;
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if let Ok(beacon) = Beacon::parse(&buf[..n], from.ip()) {
-                    return Ok(beacon);
+    Listener::bind(port)?.recv(timeout)
+}
+
+/// A socket bound to the discovery port, which can wait for beacons in
+/// several slices without leaving the port between them.
+#[cfg(feature = "net")]
+#[derive(Debug)]
+pub(crate) struct Listener {
+    socket: UdpSocket,
+}
+
+#[cfg(feature = "net")]
+impl Listener {
+    /// Listen on `0.0.0.0:port` with `SO_REUSEADDR`.
+    pub(crate) fn bind(port: u16) -> Result<Self> {
+        Ok(Self {
+            socket: bind_reusable(port)?,
+        })
+    }
+
+    /// Wait up to `timeout` for the first valid beacon. Datagrams that are not
+    /// beacons are skipped; a beacon that arrives between two calls waits in
+    /// the socket for the next one.
+    pub(crate) fn recv(&self, timeout: Duration) -> Result<Beacon> {
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 2048];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout("the device's discovery broadcast"));
+            }
+            self.socket.set_read_timeout(Some(remaining))?;
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    if let Ok(beacon) = Beacon::parse(&buf[..n], from.ip()) {
+                        return Ok(beacon);
+                    }
+                }
+                Err(e) => {
+                    match crate::error::from_read_error(e, "the device's discovery broadcast") {
+                        Error::Timeout(what) => return Err(Error::Timeout(what)),
+                        Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        other => return Err(other),
+                    }
                 }
             }
-            Err(e) => match crate::error::from_read_error(e, "the device's discovery broadcast") {
-                Error::Timeout(what) => return Err(Error::Timeout(what)),
-                Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                other => return Err(other),
-            },
         }
     }
 }
 
+#[cfg(feature = "net")]
 fn bind_reusable(port: u16) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -186,6 +220,7 @@ mod tests {
         assert!(Beacon::parse(b"[1,2]", src).is_err());
     }
 
+    #[cfg(feature = "net")]
     #[test]
     fn discovers_over_udp() {
         // Find a free port, then listen on it like `discover` does on 9999.
@@ -209,6 +244,28 @@ mod tests {
         assert_eq!(beacon.ip, "10.77.0.131".parse::<IpAddr>().unwrap());
     }
 
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_listener_keeps_a_beacon_that_arrives_between_waits() {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listener = Listener::bind(port).unwrap();
+        assert!(matches!(
+            listener.recv(Duration::from_millis(50)),
+            Err(Error::Timeout(_))
+        ));
+        // Sent while nobody waits: the bound socket holds it.
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"junk", ("127.0.0.1", port)).unwrap();
+        tx.send_to(BEACON.as_bytes(), ("127.0.0.1", port)).unwrap();
+        let beacon = listener.recv(Duration::from_millis(50)).unwrap();
+        assert_eq!(beacon.ip, "10.77.0.131".parse::<IpAddr>().unwrap());
+    }
+
+    #[cfg(feature = "net")]
     #[test]
     fn discovery_times_out() {
         let port = UdpSocket::bind("127.0.0.1:0")
