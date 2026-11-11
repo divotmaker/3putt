@@ -9,7 +9,7 @@ repository = "https://github.com/divotmaker/3putt"
 readme = "README.md"
 keywords = ["golf", "putting", "exputt", "zeromq"]
 categories = ["network-programming", "hardware-support"]
-exclude = ["CLAUDE.md", ".github/", "rust-toolchain.toml"]
+exclude = [".github/", "rust-toolchain.toml"]
 
 [lib]
 name = "threeputt"
