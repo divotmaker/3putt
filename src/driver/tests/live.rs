@@ -960,6 +960,49 @@ fn find_mat_resyncs_the_device_and_is_ready_again() {
     );
 }
 
+/// Silence past the warning threshold is published as not ready, and data
+/// from the device as ready again. The limits that end a session are an hour
+/// away, so only the warning can come.
+#[test]
+fn a_silent_device_is_not_ready_until_it_sends_again() {
+    let mock = quiet_mock();
+    let port = port_of(&mock);
+    let mut tuning = tuning(&port);
+    tuning.silence_baseline = Duration::from_secs(3600);
+    tuning.silence_after_strike = Duration::from_secs(3600);
+    let driver = ExPutt::with_tuning(localhost(), tuning).expect("driver");
+    let mut run = Run::start(driver);
+    run.until_ready(true, Some("ready"));
+    run.until_ready(false, None);
+    mock.push_event("Test,yy");
+    let seen = run.until_ready(true, None);
+    assert!(!reconnected(&seen), "no reconnect");
+}
+
+/// A hand change inside the gap is held (not ready meanwhile), and a change
+/// back to the hand in effect drops it: nothing is sent. The gap is an hour,
+/// so it cannot end during the test.
+#[test]
+fn a_hand_flipped_back_inside_the_gap_sends_nothing() {
+    let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
+    let port = port_of(&mock);
+    let mut tuning = tuning(&port);
+    tuning.resync_gap = Duration::from_secs(3600);
+    let driver = ExPutt::with_tuning(localhost(), tuning).expect("driver");
+    let mut run = Run::start(driver);
+    run.until_ready(true, Some("ready"));
+    let before = mock.received().len();
+    run.hand(Handedness::Left);
+    run.until_ready(false, None);
+    run.hand(Handedness::Right);
+    run.until_ready(true, None);
+    assert!(
+        only_keepalives(&mock.received()[before..]),
+        "{:?}",
+        mock.received()
+    );
+}
+
 /// A device whose app has stalled: it accepts every connection and greets,
 /// and never answers anything.
 struct Wedged {

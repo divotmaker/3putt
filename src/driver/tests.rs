@@ -319,6 +319,51 @@ fn the_user_is_told_once_per_outage_that_the_device_is_not_answering() {
     assert!(u.no_answer(at(120)));
 }
 
+/// How `retry_delay` uses the outage tracker and the stall wait. The user
+/// is told at the first unanswered attempt here, so no time has to pass.
+#[test]
+fn an_outage_is_told_once_and_its_later_attempts_raise_no_alert() {
+    let mut driver = ExPutt::new(Config::default()).unwrap();
+    driver.unanswered = Unanswered::new(Duration::ZERO);
+    let mut backoff = Backoff::default();
+    let unanswered = Error::Device(crate::Error::Timeout("the device's reply"));
+    let refused = Error::Device(crate::Error::Closed);
+    let none = Vec::<String>::new();
+
+    // An attempt that fails some other way is alerted on its own.
+    let (_, alerts) = retry_after(&mut driver, Some(&refused), None, &mut backoff);
+    assert_eq!(alerts, [format!("ExPutt error: {refused}")]);
+    // At the unanswered one the user is told.
+    let (_, alerts) = retry_after(&mut driver, Some(&unanswered), None, &mut backoff);
+    assert_eq!(alerts, [NOT_ANSWERING]);
+    // While the outage lasts no attempt is alerted, refused ones included,
+    // and the user is not told again.
+    for error in [&unanswered, &refused, &unanswered] {
+        let (_, alerts) = retry_after(&mut driver, Some(error), None, &mut backoff);
+        assert_eq!(alerts, none, "{error}");
+    }
+    // A session that measured ends the outage: the next one is told again.
+    let (_, alerts) = retry_after(
+        &mut driver,
+        Some(&Error::Lost),
+        Some(Duration::from_secs(2)),
+        &mut backoff,
+    );
+    assert_eq!(alerts, ["ExPutt error: connection to the device lost"]);
+    let (_, alerts) = retry_after(&mut driver, Some(&unanswered), None, &mut backoff);
+    assert_eq!(alerts, [NOT_ANSWERING]);
+
+    // A session lost to silence is followed by the stall wait.
+    let silent = Error::Silent(Duration::from_secs(90));
+    let (delay, _) = retry_after(
+        &mut driver,
+        Some(&silent),
+        Some(Duration::from_secs(300)),
+        &mut backoff,
+    );
+    assert_eq!(delay, Some(Tuning::default().stall_wait));
+}
+
 #[test]
 fn a_putt_is_a_launch_without_elevation_or_spin() {
     let launch = launch_of(&putt(PUTT_RESULT_FULL));
