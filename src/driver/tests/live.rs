@@ -5,8 +5,9 @@ use std::net::{TcpListener, UdpSocket};
 use std::sync::atomic::AtomicU16;
 use std::thread::JoinHandle;
 
-use flightrelay::Club;
 use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
+use flightrelay::types::blockers;
+use flightrelay::{Club, ShotClub, ShotFinished, ShotLaunch, ShotTrigger};
 
 use super::*;
 use crate::testing::{
@@ -72,8 +73,10 @@ fn localhost() -> Config {
 
 /// What the host saw, in order.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // a test's record, kept by value
 enum Seen {
-    /// Telemetry: the device's merged state after it.
+    /// A status: the device's state after it, with the
+    /// blockers as `ready` (`"true"` for none, `"false"` for `not_armed`).
     State(HashMap<String, String>),
     /// Any other event the driver emitted.
     Event(DeviceEvent),
@@ -87,15 +90,16 @@ enum Seen {
 }
 
 enum Input {
-    Command(DeviceCommand),
+    /// The hints of a new `golfer.turn`: they replace the earlier ones.
+    Turn(TurnHints),
     Action(Action),
 }
 
-/// The host side of a connect: inputs drain into the latched command;
-/// actions wait for the session.
+/// The host side of a connect: each turn replaces the hints; actions wait
+/// for the session.
 struct Ticks<'a> {
     inputs: &'a Receiver<Input>,
-    latched: &'a mut DeviceCommand,
+    hints: &'a mut TurnHints,
     actions: &'a mut Vec<Action>,
 }
 
@@ -103,16 +107,14 @@ impl ConnectHost for Ticks<'_> {
     fn tick(&mut self) {
         while let Ok(input) = self.inputs.try_recv() {
             match input {
-                Input::Command(cmd) => {
-                    self.latched.merge(&cmd);
-                }
+                Input::Turn(hints) => *self.hints = hints,
                 Input::Action(action) => self.actions.push(action),
             }
         }
     }
 
-    fn latched(&self) -> &DeviceCommand {
-        self.latched
+    fn hints(&self) -> &TurnHints {
+        self.hints
     }
 }
 
@@ -123,23 +125,23 @@ struct Run {
     flags: Arc<HostFlags>,
     inputs: Sender<Input>,
     seen: Receiver<Seen>,
-    /// The device's telemetry merged so far (cleared at each connect).
+    /// The device's status as last seen (cleared at each connect).
     state: HashMap<String, String>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Run {
     fn start(driver: ExPutt) -> Self {
-        Self::start_with(driver, DeviceCommand::default(), false)
+        Self::start_with(driver, TurnHints::default(), false)
     }
 
-    fn start_with(driver: ExPutt, latched: DeviceCommand, raw: bool) -> Self {
+    fn start_with(driver: ExPutt, hints: TurnHints, raw: bool) -> Self {
         let flags = HostFlags::new();
         flags.set_wants_raw(raw);
-        Self::start_flags(driver, latched, flags)
+        Self::start_flags(driver, hints, flags)
     }
 
-    fn start_flags(mut driver: ExPutt, latched: DeviceCommand, flags: HostFlags) -> Self {
+    fn start_flags(mut driver: ExPutt, hints: TurnHints, flags: HostFlags) -> Self {
         let stop = Stop::new();
         let flags = Arc::new(flags);
         let (inputs, input_rx) = mpsc::channel();
@@ -147,7 +149,7 @@ impl Run {
         let thread = {
             let (stop, flags) = (stop.clone(), Arc::clone(&flags));
             std::thread::spawn(move || {
-                host(&mut driver, &stop, &flags, &input_rx, &seen_tx, latched);
+                host(&mut driver, &stop, &flags, &input_rx, &seen_tx, hints);
             })
         };
         Self {
@@ -160,26 +162,34 @@ impl Run {
         }
     }
 
-    fn command(&self, cmd: DeviceCommand) {
-        let _ = self.inputs.send(Input::Command(cmd));
+    /// A new turn with these hints.
+    fn turn(&self, hints: TurnHints) {
+        let _ = self.inputs.send(Input::Turn(hints));
     }
 
+    /// A new turn whose only hint is the handedness.
     fn hand(&self, handed: Handedness) {
-        self.command(DeviceCommand::default().with_handed(handed));
+        self.turn(TurnHints::default().with_handedness(handed));
     }
 
     fn find_mat(&self) {
         let _ = self.inputs.send(Input::Action(Action::FindMat));
     }
 
-    /// The next thing seen within `left`, with telemetry merged.
+    /// The next thing seen within `left`, with status as a state map.
     fn next(&mut self, left: Duration) -> Option<Seen> {
         let seen = self.seen.recv_timeout(left).ok()?;
         Some(match seen {
-            Seen::Event(DeviceEvent::Frp(FrpEvent::DeviceTelemetry {
-                telemetry: Some(t), ..
-            })) => {
-                self.state.extend(t);
+            Seen::Event(DeviceEvent::Status(status)) => {
+                // A status is the whole of it: it replaces what was seen.
+                let ready = match status.blockers.as_slice() {
+                    [] => "true",
+                    [b] if b == blockers::NOT_ARMED => "false",
+                    other => panic!("unexpected blockers {other:?}"),
+                };
+                self.state.clear();
+                self.state.insert("ready".to_owned(), ready.to_owned());
+                self.state.extend(status.telemetry);
                 Seen::State(self.state.clone())
             }
             Seen::Connected(id) => {
@@ -234,13 +244,10 @@ impl Run {
     }
 
     /// The events of the next shot, trigger to finish.
-    fn next_shot(&mut self) -> Vec<FrpEvent> {
-        let events: Vec<FrpEvent> = self
-            .until("shot_finished", |s| {
-                matches!(
-                    s,
-                    Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-                )
+    fn next_shot(&mut self) -> Vec<FrpBody> {
+        let events: Vec<FrpBody> = self
+            .until("shot.finished", |s| {
+                matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
             })
             .into_iter()
             .filter_map(|s| match s {
@@ -250,8 +257,8 @@ impl Run {
             .collect();
         let start = events
             .iter()
-            .rposition(|e| matches!(e, FrpEvent::ShotTrigger { .. }))
-            .expect("shot_trigger");
+            .rposition(|e| matches!(e, FrpBody::ShotTrigger(_)))
+            .expect("shot.trigger");
         events[start..].to_vec()
     }
 
@@ -277,7 +284,7 @@ fn host(
     flags: &HostFlags,
     inputs: &Receiver<Input>,
     seen: &Sender<Seen>,
-    mut latched: DeviceCommand,
+    mut hints: TurnHints,
 ) {
     let tx = seen.clone();
     let mut sink = move |e: DeviceEvent| {
@@ -290,7 +297,7 @@ fn host(
         let connected = {
             let mut ticks = Ticks {
                 inputs,
-                latched: &mut latched,
+                hints: &mut hints,
                 actions: &mut actions,
             };
             let mut ctx = ConnectCtx::new(stop, Events::new(&mut sink, flags), &mut ticks);
@@ -310,10 +317,12 @@ fn host(
                 while failed.is_none() && !stop.is_stopped() {
                     while let Ok(input) = inputs.try_recv() {
                         let result = match input {
-                            Input::Command(cmd) => {
-                                latched.merge(&cmd);
-                                session.command(&cmd)
+                            // The session gets the hints whenever they change.
+                            Input::Turn(new) if new != hints => {
+                                hints = new;
+                                session.hints(&hints)
                             }
+                            Input::Turn(_) => Ok(()),
                             Input::Action(action) => session.action(&action),
                         };
                         if let Err(e) = result {
@@ -360,8 +369,8 @@ fn host(
         let until = Instant::now() + delay;
         while Instant::now() < until && !stop.is_stopped() {
             while let Ok(input) = inputs.try_recv() {
-                if let Input::Command(cmd) = input {
-                    latched.merge(&cmd);
+                if let Input::Turn(new) = input {
+                    hints = new;
                 }
             }
             let _ = stop.sleep(
@@ -376,7 +385,7 @@ fn host(
 fn alerts(seen: &[Seen]) -> Vec<String> {
     seen.iter()
         .filter_map(|s| match s {
-            Seen::Event(DeviceEvent::Frp(FrpEvent::Alert { message, .. })) => Some(message.clone()),
+            Seen::Event(DeviceEvent::Frp(FrpBody::BusAlert(a))) => Some(a.message.clone()),
             _ => None,
         })
         .collect()
@@ -509,17 +518,18 @@ fn a_putt_becomes_a_putter_shot_with_speed_direction_path_and_face() {
     let events = run.next_shot();
     let expected = putt(PUTT_RESULT_FULL);
     let [
-        FrpEvent::ShotTrigger { key, timestamp },
-        FrpEvent::Launch { key: k1, launch },
-        FrpEvent::ClubPath { key: k2, club },
-        FrpEvent::ShotFinished { key: k3 },
+        FrpBody::ShotTrigger(trigger),
+        FrpBody::ShotLaunch(ShotLaunch { key: k1, launch }),
+        FrpBody::ShotClub(ShotClub { key: k2, club }),
+        FrpBody::ShotFinished(ShotFinished { key: k3 }),
     ] = &events[..]
     else {
         panic!("{events:#?}");
     };
+    let key = &trigger.key;
     assert_eq!(key.shot_number, 1);
     assert!([k1, k2, k3].iter().all(|k| *k == key));
-    assert_eq!(*timestamp, None, "no strike seen, no strike time");
+    assert_eq!(trigger.timestamp, None, "no strike seen, no strike time");
     assert_eq!(*launch, launch_of(&expected));
     assert!((launch.launch_speed.unwrap().as_mps() - 2.50).abs() < 0.01);
     assert!(launch.launch_azimuth.unwrap() > 1.4, "R1.4 is positive");
@@ -540,7 +550,7 @@ fn a_pulled_putt_is_negative_left() {
     let launch = events
         .iter()
         .find_map(|e| match e {
-            FrpEvent::Launch { launch, .. } => Some(launch.clone()),
+            FrpBody::ShotLaunch(m) => Some(m.launch.clone()),
             _ => None,
         })
         .expect("launch");
@@ -548,7 +558,7 @@ fn a_pulled_putt_is_negative_left() {
     let club = events
         .iter()
         .find_map(|e| match e {
-            FrpEvent::ClubPath { club, .. } => Some(club.clone()),
+            FrpBody::ShotClub(m) => Some(m.club.clone()),
             _ => None,
         })
         .expect("club");
@@ -564,17 +574,11 @@ fn a_putt_without_putter_data_is_a_ball_only_shot() {
     mock.push_event(PUTT_RESULT_BALL_ONLY);
     let events = run.next_shot();
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, FrpEvent::ClubPath { .. })),
+        !events.iter().any(|e| matches!(e, FrpBody::ShotClub(_))),
         "{events:?}"
     );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, FrpEvent::Launch { launch, .. }
-        if launch.launch_azimuth == Some(putt(PUTT_RESULT_BALL_ONLY).launch_direction_deg)))
-    );
+    assert!(events.iter().any(|e| matches!(e, FrpBody::ShotLaunch(m)
+        if m.launch.launch_azimuth == Some(putt(PUTT_RESULT_BALL_ONLY).launch_direction_deg))));
 }
 
 #[test]
@@ -589,10 +593,10 @@ fn a_strike_dates_the_shot() {
     let after = now_ms().expect("clock");
     mock.push_event(PUTT_RESULT_FULL);
     let events = run.next_shot();
-    let FrpEvent::ShotTrigger {
+    let FrpBody::ShotTrigger(ShotTrigger {
         timestamp: Some(at),
         ..
-    } = &events[0]
+    }) = &events[0]
     else {
         panic!("{events:?}");
     };
@@ -610,10 +614,10 @@ fn a_strike_dates_the_shot() {
     assert!(
         matches!(
             events[0],
-            FrpEvent::ShotTrigger {
+            FrpBody::ShotTrigger(ShotTrigger {
                 timestamp: None,
                 ..
-            }
+            })
         ),
         "{events:?}"
     );
@@ -622,10 +626,10 @@ fn a_strike_dates_the_shot() {
 fn mock_putt(mock: &MockDevice, run: &mut Run, number: u32) {
     mock.push_event(PUTT_RESULT_FULL);
     let events = run.next_shot();
-    let FrpEvent::ShotTrigger { key, .. } = &events[0] else {
+    let FrpBody::ShotTrigger(trigger) = &events[0] else {
         unreachable!()
     };
-    assert_eq!(key.shot_number, number);
+    assert_eq!(trigger.key.shot_number, number);
 }
 
 #[test]
@@ -700,20 +704,20 @@ fn the_hand_follows_the_player() {
     let (driver, _) = driver_for(&mock);
     let mut run = Run::start_with(
         driver,
-        DeviceCommand::default().with_handed(Handedness::Left),
+        TurnHints::default().with_handedness(Handedness::Left),
         false,
     );
     run.until_ready(true, Some("ready"));
     assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
     let before = mock.received().len();
 
-    // The player is right-handed now. The mode and club of a command do
-    // not apply.
-    run.command(
-        DeviceCommand::default()
-            .with_mode(DetectionMode::Full)
+    // The player is right-handed now. The mode and club of a turn do not
+    // apply.
+    run.turn(
+        TurnHints::default()
+            .with_mode(Mode::Full)
             .with_club(Club::Driver)
-            .with_handed(Handedness::Right),
+            .with_handedness(Handedness::Right),
     );
     let mut seen = run.until_ready(false, Some("ready"));
     seen.extend(run.until_ready(true, Some("ready")));
@@ -741,7 +745,7 @@ fn the_hand_follows_the_player() {
 }
 
 #[test]
-fn a_hand_latched_while_the_session_starts_is_a_restart_to_it() {
+fn a_hand_hinted_while_the_session_starts_is_a_restart_to_it() {
     // The device finds no mat until told to, so the session start waits.
     let mock = MockDevice::spawn(MockConfig {
         find_mat: false,
@@ -750,7 +754,7 @@ fn a_hand_latched_while_the_session_starts_is_a_restart_to_it() {
     .expect("mock");
     let (driver, _) = driver_for(&mock);
     let mut run = Run::start(driver);
-    // The session start has read the hand (right, nothing latched) and is
+    // The session start has read the hand (right, no hint yet) and is
     // waiting for the mat when the player turns out to be left-handed.
     assert!(sent(&mock, Request::ResyncToMat));
     run.hand(Handedness::Left);
@@ -779,15 +783,23 @@ fn a_hand_latched_while_the_session_starts_is_a_restart_to_it() {
     );
 }
 
+/// A turn with no handedness keeps the device's hand, so a left-handed
+/// session stays left-handed.
 #[test]
 fn a_mode_or_club_alone_changes_nothing() {
     let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
     let (driver, _) = driver_for(&mock);
-    let mut run = Run::start(driver);
+    let mut run = Run::start_with(
+        driver,
+        TurnHints::default().with_handedness(Handedness::Left),
+        false,
+    );
     run.until_ready(true, Some("ready"));
+    assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
     let before = mock.received().len();
-    run.command(DeviceCommand::default().with_mode(DetectionMode::Chipping));
-    run.command(DeviceCommand::default().with_club(Club::PitchingWedge));
+    run.turn(TurnHints::default().with_mode(Mode::Chipping));
+    run.turn(TurnHints::default().with_club(Club::PitchingWedge));
+    run.turn(TurnHints::default());
     std::thread::sleep(Duration::from_millis(300));
     assert!(only_keepalives(&mock.received()[before..]));
     assert!(run.drain().iter().all(|s| !matches!(s, Seen::State(_))));
@@ -799,7 +811,7 @@ fn a_device_that_is_not_there_is_retried() {
     let driver = ExPutt::with_tuning(localhost(), tuning(&port)).expect("driver");
     let mut run = Run::start(driver);
     let seen = run.until("alert", |s| {
-        matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::Alert { .. })))
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::BusAlert(_))))
     });
     assert!(!seen.iter().any(|s| matches!(s, Seen::Connected(_))));
     assert!(alerts(&seen)[0].starts_with("ExPutt error: "), "{seen:?}");
@@ -902,10 +914,10 @@ fn discovery_without_a_device_hints_once() {
     let driver = ExPutt::with_tuning(Config::default(), tuning).expect("driver");
     let mut run = Run::start(driver);
     let mut seen = run.until("alert", |s| {
-        matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::Alert { .. })))
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::BusAlert(_))))
     });
     let severity = seen.iter().find_map(|s| match s {
-        Seen::Event(DeviceEvent::Frp(FrpEvent::Alert { severity, .. })) => Some(*severity),
+        Seen::Event(DeviceEvent::Frp(FrpBody::BusAlert(a))) => Some(a.severity),
         _ => None,
     });
     assert_eq!(severity, Some(Severity::Warn));
@@ -947,10 +959,7 @@ fn readiness_follows_the_putt_cycle() {
     // The result changes neither value.
     mock.push_event(PUTT_RESULT_FULL);
     let shot = run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     });
     assert!(
         !shot.iter().any(|s| matches!(s, Seen::State(_))),
@@ -1034,9 +1043,10 @@ impl Drop for Wedged {
 fn alert_times(run: &mut Run, what: &str, want: impl Fn(&str) -> bool) -> Vec<(String, Instant)> {
     let seen = std::cell::RefCell::new(Vec::new());
     run.until(what, |s| {
-        let Seen::Event(DeviceEvent::Frp(FrpEvent::Alert { message, .. })) = s else {
+        let Seen::Event(DeviceEvent::Frp(FrpBody::BusAlert(alert))) = s else {
             return false;
         };
+        let message = &alert.message;
         seen.borrow_mut().push((message.clone(), Instant::now()));
         want(message)
     });
@@ -1315,21 +1325,18 @@ fn a_stop_during_a_wedged_session_start_ends_within_the_stop_wait() {
 fn putts_and_messages_are_raw_frames_while_wanted() {
     let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
     let (driver, _) = driver_for(&mock);
-    let mut run = Run::start_with(driver, DeviceCommand::default(), true);
+    let mut run = Run::start_with(driver, TurnHints::default(), true);
     let mut seen = run.until_ready(true, Some("ready"));
     // A keepalive and a heartbeat go by.
     std::thread::sleep(Duration::from_millis(300));
     mock.push_event(PUTT_RESULT_FULL);
     seen.extend(run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     }));
     let frames: Vec<RawFrame> = seen
         .iter()
         .filter_map(|s| match s {
-            Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(f))) => Some(f.clone()),
+            Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(f))) => Some(f.clone()),
             _ => None,
         })
         .collect();
@@ -1343,7 +1350,7 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
     let key = seen
         .iter()
         .find_map(|s| match s {
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotTrigger { key, .. })) => Some(key.clone()),
+            Seen::Event(DeviceEvent::Frp(FrpBody::ShotTrigger(t))) => Some(t.key.clone()),
             _ => None,
         })
         .expect("trigger");
@@ -1361,16 +1368,11 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
     let finished = seen.len() - 1;
     let frame_at = seen
         .iter()
-        .position(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(f))) if f.label.as_deref() == Some("PuttResult")))
+        .position(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(f))) if f.label.as_deref() == Some("PuttResult")))
         .expect("frame");
     let trigger_at = seen
         .iter()
-        .position(|s| {
-            matches!(
-                s,
-                Seen::Event(DeviceEvent::Frp(FrpEvent::ShotTrigger { .. }))
-            )
-        })
+        .position(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotTrigger(_)))))
         .expect("trigger");
     assert!(frame_at < trigger_at && trigger_at < finished);
 
@@ -1384,14 +1386,14 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
         .count();
     assert!(audited > 0, "camera frames audited");
     assert!(
-        !seen.iter().any(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(f))) if f.data.windows(4).any(|w| w == b"/9j/"))),
+        !seen.iter().any(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(f))) if f.data.windows(4).any(|w| w == b"/9j/"))),
         "no image leaves as a raw frame"
     );
 }
 
 fn raw_frames(seen: &[Seen]) -> usize {
     seen.iter()
-        .filter(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(_)))))
+        .filter(|s| matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(_)))))
         .count()
 }
 
@@ -1401,7 +1403,7 @@ fn raw_frames_start_and_stop_with_the_hosts_wish() {
     let (driver, _) = driver_for(&mock);
     let flags = HostFlags::new();
     flags.set_min_level(Level::Info);
-    let mut run = Run::start_flags(driver, DeviceCommand::default(), flags);
+    let mut run = Run::start_flags(driver, TurnHints::default(), flags);
     run.until_ready(true, Some("ready"));
     // Heartbeats and keepalives go by, unwanted.
     std::thread::sleep(Duration::from_millis(400));
@@ -1410,18 +1412,15 @@ fn raw_frames_start_and_stop_with_the_hosts_wish() {
     // A controller asks for raw frames: the messages from then on arrive.
     run.flags.set_wants_raw(true);
     run.until("a raw frame", |s| {
-        matches!(s, Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(_))))
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(_))))
     });
     mock.push_event(PUTT_RESULT_FULL);
     let shot = run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     });
     assert!(shot.iter().any(|s| matches!(
         s,
-        Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(f))) if f.label.as_deref() == Some("PuttResult")
+        Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(f))) if f.label.as_deref() == Some("PuttResult")
     )));
 
     // The last one leaves: frames stop, the session goes on.
@@ -1431,10 +1430,7 @@ fn raw_frames_start_and_stop_with_the_hosts_wish() {
     std::thread::sleep(Duration::from_millis(600));
     mock.push_event(PUTT_RESULT_FULL);
     let shot = run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     });
     assert_eq!(raw_frames(&shot), 0, "{shot:#?}");
     assert!(!reconnected(&shot));
@@ -1451,10 +1447,7 @@ fn trace_alone_logs_every_message_as_hex() {
     std::thread::sleep(Duration::from_millis(400));
     mock.push_event(PUTT_RESULT_FULL);
     seen.extend(run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     }));
     assert_eq!(raw_frames(&seen), 0);
     let traced = |prefix: &str| {
@@ -1493,17 +1486,14 @@ fn no_raw_frames_or_audit_lines_unless_wanted() {
     let (driver, _) = driver_for(&mock);
     let flags = HostFlags::new();
     flags.set_min_level(Level::Info);
-    let mut run = Run::start_flags(driver, DeviceCommand::default(), flags);
+    let mut run = Run::start_flags(driver, TurnHints::default(), flags);
     run.until_ready(true, Some("ready"));
     mock.push_event(PUTT_RESULT_FULL);
     let seen = run.until("shot_finished", |s| {
-        matches!(
-            s,
-            Seen::Event(DeviceEvent::Frp(FrpEvent::ShotFinished { .. }))
-        )
+        matches!(s, Seen::Event(DeviceEvent::Frp(FrpBody::ShotFinished(_))))
     });
     assert!(!seen.iter().any(|s| matches!(
         s,
-        Seen::Event(DeviceEvent::Frp(FrpEvent::RawFrame(_)) | DeviceEvent::Log(Level::Trace, _))
+        Seen::Event(DeviceEvent::Frp(FrpBody::ShotRaw(_)) | DeviceEvent::Log(Level::Trace, _))
     )));
 }

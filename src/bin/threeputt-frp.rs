@@ -1,4 +1,4 @@
-//! The ExPutt RG served to Flight Relay Protocol controllers.
+//! The ExPutt RG as a launch monitor actor on a Flight Relay Protocol bus.
 //!
 //! ```text
 //! threeputt-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]

@@ -148,9 +148,9 @@ them 180° to view. Ctrl-C ends the session cleanly.
 
 `threeputt::driver::ExPutt` serves the device to any host of flightrelay's
 `DeviceDriver` contract, and `threeputt-frp` is that driver as a standalone
-[Flight Relay Protocol](https://github.com/flightrelay/spec) (FRP 0.2.0)
-device: it listens for FRP controllers (or dials one) and sends each putt as
-a shot.
+[Flight Relay Protocol](https://github.com/flightrelay/spec) (FRP 0.3.0)
+launch monitor actor: it listens for peers on the FRP bus (or dials a hub)
+and sends each putt as a shot.
 
 ```sh
 cargo install threeputt --features frp
@@ -159,37 +159,44 @@ threeputt-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>] \
 ```
 
 - `--target`: an address to listen on (default `0.0.0.0:5880`), or a `ws://`
-  URL to dial.
+  URL of a hub to dial.
 - `--set address=192.168.1.40`: the device's IP address. Without it the
   device is found by its discovery beacon. `--config` takes a TOML file with
-  the same keys (`address = "192.168.1.40"`).
+  the same keys (`address = "192.168.1.40"`), and the runner's own settings
+  in an `[frp]` table: `actor_id` (the actor's id on the bus, generated and
+  written into the file on the first run so it stays the same across
+  restarts) and `raw_frames` (default `false`).
 - `--help` lists every config key with its default.
 
 Ctrl-C closes the session (the device is told the client is leaving) and
 exits 0. An invalid value exits 2.
 
-What a controller receives:
+What goes on the bus:
 
-- `device_telemetry` with model `ExPutt RG`, `source` `measured`, the device
-  software version as `firmware` when the device was discovered, and the
-  keys `ready` and `device_state` (`finding mat`, `mat found`, `ready`,
-  `ball struck`).
-- Per putt: `shot_trigger` (with the strike time when the device reported
-  the strike), `launch` with ball speed and launch direction (no vertical
-  launch and no spin: the device measures neither), `club_path` with putter
-  path and face angle when the putter was tracked, and `shot_finished`.
-- A controller's `set_detection_mode` with a hand starts a new round with
-  that hand; its mode and club do not apply (the device only measures putts).
-- `raw_frame`s, for a controller that asks for them: each message as JSON
-  text, labeled with its name. Camera images and unrecognized messages are
-  never sent.
+- The actor's `bus.actor`: a `device` block with model `ExPutt RG`,
+  `source` `measured` and the device software version as `firmware` when the
+  device was discovered; the `not_armed` blocker whenever the device is not
+  ready for a putt (no blockers when it is); and the telemetry key
+  `device_state` (`finding mat`, `mat found`, `ready`, `ball struck`).
+- Per putt: `shot.trigger` (with the strike time when the device reported
+  the strike), `shot.launch` with ball speed and launch direction (no
+  vertical launch and no spin: the device measures neither), `shot.club`
+  with putter path and face angle when the putter was tracked, and
+  `shot.finished`.
+- A `golfer.turn` whose handedness differs from the device's hand starts a
+  new round with that hand; a turn without one keeps the hand (right-handed
+  before any). Its mode and club do not apply (the device only measures
+  putts).
+- `shot.raw` frames when `raw_frames` is on: each message as JSON text,
+  labeled with its name. Camera images and unrecognized messages are never
+  sent.
 
 The driver gives a device that stops answering time to recover: a session may
-be silent for 90 s (120 s after a strike) and `ready` is false from 10 s of
-silence; after a silent device the next attempt waits at least 15 s; mat
+be silent for 90 s (120 s after a strike) and it reports `not_armed` from
+10 s of silence; after a silent device the next attempt waits at least 15 s; mat
 searches (a hand change, Find mat) are at least 10 s apart, with requests in
 between folded into one. After two minutes of attempts the device accepts but
-never answers, one alert says so and the per-attempt alerts stop until a
+never answers, one `bus.alert` says so and the per-attempt alerts stop until a
 session succeeds.
 
 A stop during a session start can take up to 18 s: the connect, greeting,

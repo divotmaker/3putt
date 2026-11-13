@@ -28,8 +28,8 @@
 //! - **`driver`**: `driver::ExPutt`, a [flightrelay](https://docs.rs/flightrelay)
 //!   `DeviceDriver` for the device: discovery, the session, putts as FRP
 //!   shots, and reconnects paced for a device that stalls.
-//! - **`frp`**: the `threeputt-frp` binary, which serves the driver to Flight
-//!   Relay Protocol controllers.
+//! - **`frp`**: the `threeputt-frp` binary, which runs the driver as a launch
+//!   monitor actor on a Flight Relay Protocol bus.
 //! - **`testing`**: `testing`, an in-process mock device.
 //!
 //! Reverse engineered for interoperability under DMCA §1201(f). No licensing is

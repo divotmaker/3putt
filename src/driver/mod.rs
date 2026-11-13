@@ -2,21 +2,25 @@
 //!
 //! [`ExPutt`] finds the device on the network (or uses
 //! [`Config::address`]), starts a [`Session`] with the player's hand, and
-//! turns every putt into an FRP shot: `shot_trigger`, `launch` (ball speed
-//! and launch direction), `club_path` (putter path and face angle, when the
-//! putter was tracked) and `shot_finished`. The device measures no vertical
-//! launch and no spin, so `launch` carries neither. Telemetry is `ready` and
-//! `device_state` (`finding mat`, `mat found`, `ready`, `ball struck`).
+//! turns every putt into an FRP shot: `shot.trigger`, `shot.launch` (ball
+//! speed and launch direction), `shot.club` (putter path and face angle, when
+//! the putter was tracked) and `shot.finished`. The device measures no
+//! vertical launch and no spin, so the launch carries neither. Its status is
+//! the `not_armed` blocker whenever the device is not ready for a putt (none
+//! when it is), and the `device_state` telemetry key (`finding mat`,
+//! `mat found`, `ready`, `ball struck`).
 //!
-//! A host serves it with flightrelay's `FrpServer` (feature `frp` builds the
-//! `threeputt-frp` binary on `flightrelay::run`), or drives it itself through
-//! the `DeviceDriver` contract.
+//! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
+//! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
+//! or drives it itself through the `DeviceDriver` contract.
 //!
-//! # Commands and actions
+//! # Hints and actions
 //!
-//! - A latched hand (`DeviceCommand::handed`) starts a new round with that
-//!   hand ([`Session::restart_match`]). The detection mode and the club do
-//!   not apply: the device only measures putts
+//! - The handedness of a `golfer.turn` (`TurnHints::handedness`), when it
+//!   differs from the hand the device has, starts a new round with that hand
+//!   ([`Session::restart_match`]). A turn with no handedness keeps the hand
+//!   the device has; a session starts right-handed when there is none. The
+//!   mode and the club do not apply: the device only measures putts
 //!   (`DriverInfo::fixed_mode` is putting).
 //! - [`Action::FindMat`] has the device locate the mat again
 //!   ([`Session::find_mat`]).
@@ -24,8 +28,8 @@
 //! Both run a mat search, and mat searches are spaced: none starts within
 //! 10 s of the previous one (the session's own at its start included). A
 //! request inside that gap waits for its end; requests made meanwhile fold
-//! into the latest hand and one mat search. `ready` is reported false while
-//! one waits.
+//! into the latest hand and one mat search. The `not_armed` blocker is
+//! reported while one waits.
 //!
 //! # A device that stalls
 //!
@@ -33,14 +37,14 @@
 //! carry on, so the driver gives it time:
 //!
 //! - A session may stay silent for 90 s, and 120 s after a strike until the
-//!   putt's result or the device is ready again. `ready` is reported false
-//!   from 10 s of silence until the device sends again. Past the limit the
+//!   putt's result or the device is ready again. The `not_armed` blocker is
+//!   reported from 10 s of silence until the device sends again. Past the limit the
 //!   session ends with [`Error::Silent`].
 //! - After a session lost to silence, the next attempt waits at least 15 s,
 //!   and attempts stay at least 15 s apart until a session succeeds.
 //! - After a session that was measuring, the first three attempts wait at
 //!   most 1 s.
-//! - Each failed attempt raises an "ExPutt error" alert, until two minutes
+//! - Each failed attempt raises an "ExPutt error" `bus.alert`, until two minutes
 //!   of attempts the device accepted but never answered have passed. Then one
 //!   alert says the device is not answering, and the attempts go on quietly
 //!   until a session succeeds.
@@ -51,13 +55,13 @@
 //!
 //! # Raw frames
 //!
-//! While a host wants raw frames, every message the session sends and every
-//! known message it receives becomes a `raw_frame`: the JSON text as it
+//! While the host's configuration turns raw frames on, every message the
+//! session sends and every known message it receives becomes a `shot.raw`: the JSON text as it
 //! crossed the socket, labeled with its name (`PuttResult`, `Test`,
 //! `resyncToMat`, …). A putt result's frame carries the shot's key. Camera
 //! images and messages the crate does not recognize are never sent as raw
-//! frames; they reach only the host's trace log, as hex. While no host wants
-//! raw frames, a trace log gets every message that way.
+//! frames; they reach only the host's trace log, as hex. While raw frames are
+//! off, a trace log gets every message that way.
 
 mod tuning;
 
@@ -70,12 +74,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    Backoff, ConnectCtx, DeviceCommand, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo,
-    Events, Level, RawProfile, SessionEnd, ShotIds, Stopped,
+    Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DeviceStatus, DriverInfo,
+    Events, Level, RawProfile, SessionEnd, ShotIds, Stopped, TurnHints,
 };
 use flightrelay::{
-    ClubData, DetectionMode, FrpEvent, Handedness, Launch, RawDir, RawFrame, Severity, ShotKey,
-    Source, Velocity,
+    ClubData, FrpBody, Handedness, Launch, Mode, RawDir, RawFrame, Severity, ShotKey, Source,
+    Velocity,
 };
 use serde::Deserialize;
 
@@ -122,7 +126,7 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 /// app can stall for half a minute or more and then carry on, so a stalled
 /// device is given time. A connection the device closes or resets ends the
 /// session at once; a device that just disappears is found by this limit
-/// alone. `ready` is reported false from the warning on.
+/// alone. The `not_armed` blocker is reported from the warning on.
 const SILENCE: SilenceLimits = SilenceLimits {
     baseline: Duration::from_secs(90),
     after_strike: Duration::from_secs(120),
@@ -287,7 +291,7 @@ impl DeviceDriver for ExPutt {
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("exputt", MODEL, Source::Measured)
             .exclusive()
-            .with_fixed_mode(DetectionMode::Putting)
+            .with_fixed_mode(Mode::Putting)
             .with_raw(RawProfile::new(RAW_TRANSPORT, 64, 64, 0, |_| false, true))
     }
 
@@ -329,7 +333,7 @@ impl DeviceDriver for ExPutt {
         };
 
         ctx.out.phase("connecting");
-        let hand = hand_of(ctx.latched().handed);
+        let hand = hand_of(ctx.hints().handedness);
         ctx.out.log(
             Level::Info,
             format!("connecting to the ExPutt at {ip} ({hand:?} hand)..."),
@@ -369,10 +373,11 @@ impl DeviceDriver for ExPutt {
             hold_to_log: false,
             totals: Arc::clone(&self.totals),
         };
-        // A hand latched while the session started is a request like any
-        // other. After a stop, dropping the session closes it.
+        // A handedness hint that arrived while the session started is a
+        // request like any other. After a stop, dropping the session closes
+        // it.
         ctx.tick()?;
-        if let Some(handed) = ctx.latched().handed {
+        if let Some(handed) = ctx.hints().handedness {
             session.gate.want_hand(hand_of(Some(handed)));
             session.hold_to_log = true;
         }
@@ -449,12 +454,12 @@ pub struct ExPuttSession {
     /// The mat search in progress, when it started, and whether it is the
     /// session's own (whose time includes connect and handshake).
     mat_search: Option<(Instant, bool)>,
-    /// Telemetry as last reported.
+    /// Status as last reported: `ready` and `device_state`.
     published: HashMap<&'static str, &'static str>,
     /// When the ball was struck (UTC ms), until the putt's result or the
     /// device is ready again.
     struck_at: Option<u64>,
-    /// A command or action asked for a mat search since the last poll, which
+    /// A hint or action asked for a mat search since the last poll, which
     /// logs whether it is held back.
     hold_to_log: bool,
     totals: Arc<Totals>,
@@ -476,21 +481,28 @@ impl ExPuttSession {
         }
     }
 
-    /// Report `ready` (and `device_state`, when given) if either changed.
+    /// Report `ready` (as the blockers: none, or `not_armed`) and
+    /// `device_state` (telemetry, when given), each only if it changed. What
+    /// goes out is the whole status: the device has no battery or attitude,
+    /// and `device_state` is the last state it reported.
     fn report(&mut self, out: &mut Events<'_>, device_state: Option<&'static str>) {
-        let mut changed = Vec::new();
         let ready = self.published_ready();
-        if self.set("ready", ready) {
-            changed.push(("ready", ready));
+        let mut changed = self.set("ready", ready);
+        if let Some(state) = device_state {
+            changed |= self.set("device_state", state);
         }
-        if let Some(state) = device_state
-            && self.set("device_state", state)
-        {
-            changed.push(("device_state", state));
+        if !changed {
+            return;
         }
-        if !changed.is_empty() {
-            out.telemetry(changed);
+        let mut status = if ready == "true" {
+            DeviceStatus::new()
+        } else {
+            DeviceStatus::not_armed()
+        };
+        if let Some(state) = self.published.get("device_state") {
+            status = status.with_telemetry("device_state", *state);
         }
+        out.status(status);
     }
 
     /// Logs how long a requested mat search is held back, if it is.
@@ -518,7 +530,7 @@ impl ExPuttSession {
             match classify(message.dir, &message.body) {
                 Frame::Shared(label) if out.wants_raw() => {
                     let key = putt.filter(|_| label == PUTT_RESULT_LABEL).cloned();
-                    out.frp(FrpEvent::raw_frame(RawFrame {
+                    out.frp(FrpBody::ShotRaw(RawFrame {
                         timestamp: message.at,
                         label: Some(label.to_owned()),
                         key,
@@ -556,7 +568,7 @@ impl ExPuttSession {
         }
         out.launch(key.clone(), launch_of(putt));
         if let Some(club) = club_of(putt) {
-            out.club_path(key.clone(), club);
+            out.club(key.clone(), club);
         } else {
             out.log(Level::Debug, "  no putter data (putter not tracked)");
         }
@@ -732,11 +744,12 @@ impl DeviceSession for ExPuttSession {
         Ok(())
     }
 
-    /// Follow the player's hand: a new round, which finds the mat first, so
-    /// the device is not ready until it reports ready again. The detection
+    /// Follow the golfer's handedness: a new round when it differs from the
+    /// device's hand, which finds the mat first, so the device is not ready
+    /// until it reports ready again. No handedness hint keeps the hand. The
     /// mode and the club do not apply: the device only measures putts.
-    fn command(&mut self, cmd: &DeviceCommand) -> Result<(), Error> {
-        if let Some(handed) = cmd.handed {
+    fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
+        if let Some(handed) = hints.handedness {
             self.gate.want_hand(hand_of(Some(handed)));
             self.hold_to_log = true;
         }
@@ -762,7 +775,7 @@ impl DeviceSession for ExPuttSession {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
         out.log(Level::Info, "closing the session");
-        out.ready(false);
+        out.status(DeviceStatus::not_armed());
         if let Err(e) = self.session.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }

@@ -82,7 +82,7 @@ fn the_driver_is_a_measured_putting_mat_with_text_raw_frames() {
     assert_eq!(info.name, "ExPutt RG");
     assert_eq!(info.source, Source::Measured);
     assert!(info.exclusive);
-    assert_eq!(info.fixed_mode, Some(DetectionMode::Putting));
+    assert_eq!(info.fixed_mode, Some(Mode::Putting));
     let raw = info.raw.expect("raw profile");
     assert_eq!(raw.transport, "exputt-wifi");
     assert!(raw.text);
@@ -151,11 +151,12 @@ fn retry_after(
     connected_for: Option<Duration>,
     backoff: &mut Backoff,
 ) -> (Option<Duration>, Vec<String>) {
+    use flightrelay::BusAlert;
     use flightrelay::driver::{DeviceEvent, HostFlags};
     let flags = HostFlags::new();
     let mut alerts = Vec::new();
     let mut sink = |e: DeviceEvent| {
-        if let DeviceEvent::Frp(FrpEvent::Alert { message, .. }) = e {
+        if let DeviceEvent::Frp(FrpBody::BusAlert(BusAlert { message, .. })) = e {
             alerts.push(message);
         }
     };
