@@ -140,14 +140,14 @@ them 180° to view. Ctrl-C ends the session cleanly.
 |---|---|
 | `net` (default) | `discover` (the UDP beacon socket, via `socket2`); a build with `default-features = false` that calls `discover` turns `net` on |
 | `config` | `threeputt::config::Config`, the driver's settings, with no network code: it builds for `wasm32-unknown-unknown` with `--no-default-features --features config` |
-| `driver` | `threeputt::driver::ExPutt`, a [flightrelay](https://crates.io/crates/flightrelay) `DeviceDriver` |
+| `driver` | `threeputt::driver::ExPutt`, a [flightrelay](https://crates.io/crates/flightrelay) `FrpDriver` |
 | `frp` | the `threeputt-frp` binary |
-| `testing` | `threeputt::testing::MockDevice`, and test timings for the driver |
+| `testing` | `threeputt::testing::MockDevice`, and the driver's ports and session timings (`Tuning`) |
 
 ## FRP driver and `threeputt-frp` (beta)
 
 `threeputt::driver::ExPutt` serves the device to any host of flightrelay's
-`DeviceDriver` contract, and `threeputt-frp` is that driver as a standalone
+`FrpDriver` contract, and `threeputt-frp` is that driver as a standalone
 [Flight Relay Protocol](https://github.com/flightrelay/spec) (FRP 0.3.0)
 launch monitor actor: it listens for peers on the FRP bus (or dials a hub)
 and sends each putt as a shot.
@@ -190,6 +190,10 @@ What goes on the bus:
 - `shot.raw` frames when `raw_frames` is on: each message as JSON text,
   labeled with its name. Camera images and unrecognized messages are never
   sent.
+
+A host steps the session with its own clock (flightrelay's `step(now)`): each
+step handles at most one device message, and every timer below runs on that
+`now`.
 
 The driver gives a device that stops answering time to recover: a session may
 be silent for 90 s (120 s after a strike) and it reports `not_armed` from

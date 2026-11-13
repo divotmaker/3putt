@@ -316,6 +316,29 @@ fn run_connection(
 
     stream.set_read_timeout(Some(Duration::from_millis(10)))?;
     let mut frames = FrameReader::new(stream);
+    let result = exchange(&mut frames, &mut out, config, find_mat, log, inbox, stop);
+    if result.is_err() {
+        // The exchange ended on an I/O error, typically a write after the
+        // client reset the connection. What the client sent before the reset
+        // is still readable.
+        while let Ok(body) = frames.read_message() {
+            record(log, &body);
+        }
+    }
+    result
+}
+
+/// Serve the client until it closes, [`MockDevice::disconnect`] is called,
+/// or a write fails.
+fn exchange(
+    frames: &mut FrameReader<TcpStream>,
+    out: &mut TcpStream,
+    config: &MockConfig,
+    find_mat: &AtomicBool,
+    log: &Mutex<Log>,
+    inbox: &Receiver<Vec<u8>>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     let mut connected = false;
     let mut next_heartbeat = Instant::now();
     let mut streaming = false;
@@ -325,17 +348,17 @@ fn run_connection(
             return frames.get_ref().shutdown(std::net::Shutdown::Both);
         }
         while let Ok(body) = inbox.try_recv() {
-            zmtp::write_frame(&mut out, &body)?;
+            zmtp::write_frame(out, &body)?;
         }
         if let Some(period) = config.heartbeat
             && connected
             && Instant::now() >= next_heartbeat
         {
-            zmtp::write_frame(&mut out, &device_event("Test,yy"))?;
+            zmtp::write_frame(out, &device_event("Test,yy"))?;
             next_heartbeat = Instant::now() + period;
         }
         if streaming && Instant::now() >= next_frame {
-            send_frame(&mut out, config, log)?;
+            send_frame(out, config, log)?;
             next_frame = Instant::now() + config.frame_interval;
         }
         match frames.read_message() {
@@ -345,14 +368,14 @@ fn run_connection(
                 match (packet.packet_id.as_str(), packet.comment.as_deref()) {
                     ("N_TEST", Some("resyncToMat")) => {
                         streaming = true;
-                        send_frame(&mut out, config, log)?;
+                        send_frame(out, config, log)?;
                         next_frame = Instant::now() + config.frame_interval;
                     }
                     ("N_TEST", Some("stopSendImage")) => streaming = false,
                     _ => {}
                 }
                 for reply in replies(config, find_mat.load(Ordering::SeqCst), &packet) {
-                    zmtp::write_frame(&mut out, &reply)?;
+                    zmtp::write_frame(out, &reply)?;
                 }
             }
             Err(Error::Io(e))

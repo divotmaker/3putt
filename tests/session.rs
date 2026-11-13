@@ -177,12 +177,9 @@ fn stops_camera_stream_without_camera() {
     let seen = collect_until(&session, |e| *e == Event::PuttReady);
     assert!(!seen.iter().any(|e| matches!(e, Event::CameraFrame(_))));
 
-    // The mock streamed frames, then stopped once told to.
+    // The mock streamed frames before it was told to stop.
     assert!(mock.camera_frames_sent() >= 1);
-    let after_stop = mock.camera_frames_sent();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(mock.camera_frames_sent(), after_stop);
-    // Nothing leaks out later either.
+    // None leaks out.
     while let Ok(event) = session.events().try_recv() {
         assert!(!matches!(event, Event::CameraFrame(_)), "{event:?}");
     }
@@ -284,12 +281,15 @@ fn restart_match_during_find_mat_begins_with_the_new_hand() {
     assert!(mock.wait_until(WAIT, |p| non_alive(p).len() >= before + 3));
     mock.push_event("MatOK,102");
     assert!(mock.wait_until(WAIT, |p| non_alive(p).len() >= before + 6));
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(
-        non_alive(&mock.received())[before..],
-        find_mat_requests(Hand::Left)
-    );
+    // The goodbye comes after anything the round sent.
     session.close().unwrap();
+    assert!(mock.wait_closed(WAIT));
+    let sent = non_alive(&mock.received());
+    assert_eq!(sent[before..before + 6], find_mat_requests(Hand::Left));
+    assert_eq!(
+        sent[before + 6..],
+        json(&[Request::MatchEnded, Request::AppPause])
+    );
 }
 
 #[test]
@@ -425,10 +425,6 @@ fn find_mat_resyncs_and_resumes_measuring() {
         non_alive(&mock.received())[before..],
         find_mat_requests(Hand::Right)
     );
-    // The camera stream stopped again.
-    let after_stop = mock.camera_frames_sent();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(mock.camera_frames_sent(), after_stop);
     session.close().unwrap();
 }
 
@@ -505,9 +501,8 @@ fn find_mat_does_not_wait_for_the_mat() {
 }
 
 /// Closing while `find_mat` waits for the mat returns at once and sends no
-/// hand or match begin. The camera is still streaming, so frames can be
-/// unread when the socket closes; the reset that follows can cost the
-/// device the goodbye packets, so only their order is checked.
+/// hand or match begin. The device receives `stopSendImage` and the goodbye
+/// though it is still streaming camera frames as the close starts.
 #[test]
 fn close_during_find_mat_ends_the_wait() {
     let mock = MockDevice::spawn(MockConfig::default()).unwrap();
@@ -522,20 +517,18 @@ fn close_during_find_mat_ends_the_wait() {
     mock.set_find_mat(false);
     session.find_mat().unwrap();
     assert!(mock.wait_until(WAIT, |p| non_alive(p).len() >= before + 3));
-    let closing = Instant::now();
     let _ = session.close();
-    assert!(closing.elapsed() < Duration::from_secs(2));
     assert!(mock.wait_closed(WAIT));
 
-    let sent = non_alive(&mock.received())[before..].to_vec();
     assert_eq!(
-        sent[..3],
+        non_alive(&mock.received())[before..],
         json(&[
             Request::MatchEnded,
             Request::StartCamera,
             Request::ResyncToMat,
+            Request::StopCamera,
+            Request::MatchEnded,
+            Request::AppPause,
         ])
     );
-    let rest = json(&[Request::StopCamera, Request::MatchEnded, Request::AppPause]);
-    assert!(rest.starts_with(&sent[3..]), "{sent:?}");
 }

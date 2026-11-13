@@ -26,7 +26,7 @@
 //!   network dependency (it builds for `wasm32-unknown-unknown` with
 //!   `--no-default-features`).
 //! - **`driver`**: `driver::ExPutt`, a [flightrelay](https://docs.rs/flightrelay)
-//!   `DeviceDriver` for the device: discovery, the session, putts as FRP
+//!   `FrpDriver` for the device: discovery, the session, putts as FRP
 //!   shots, and reconnects paced for a device that stalls.
 //! - **`frp`**: the `threeputt-frp` binary, which runs the driver as a launch
 //!   monitor actor on a Flight Relay Protocol bus.

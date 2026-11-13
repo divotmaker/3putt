@@ -15,6 +15,10 @@ use crate::error::Result;
 use crate::event::Event;
 use crate::packet::{Hand, Request};
 
+/// The longest [`Session::close`] reads, after the goodbye, while waiting for
+/// the device to close its end of the connection.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
+
 /// Options for [`Session::start`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOptions {
@@ -76,7 +80,8 @@ impl Default for SessionOptions {
 /// every new round ([`restart_match`](Self::restart_match)) does too.
 ///
 /// [`close`](Self::close) (or dropping the session) ends measuring, tells the
-/// device the client is leaving, and closes the socket. When the device drops
+/// device the client is leaving, and closes the socket once the device has
+/// closed its end (waiting at most half a second). When the device drops
 /// the connection, the event channel disconnects. So it does when a keepalive
 /// cannot be sent: the socket is shut down, the reader thread ends, and
 /// [`is_connected`](Self::is_connected) turns false.
@@ -87,6 +92,10 @@ pub struct Session {
     stop_keepalive: Option<Sender<()>>,
     keepalive: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
+    /// Disconnects when the reader thread ends.
+    reader_done: Receiver<()>,
+    /// How long a close reads while waiting for the device to close its end.
+    close_wait: Duration,
     /// Cleared by the reader thread before the event channel disconnects.
     receiving: Arc<AtomicBool>,
     /// Signaled by the reader thread on the next [`Event::MatFound`], and
@@ -149,6 +158,7 @@ impl Session {
         let mat_waiter = Arc::new(Mutex::new(None));
         let receiving = Arc::new(AtomicBool::new(true));
         let deliver_frames = options.camera;
+        let (done_tx, reader_done) = mpsc::channel::<()>();
         let reader = {
             let mat_waiter = Arc::clone(&mat_waiter);
             let receiving = Arc::clone(&receiving);
@@ -157,6 +167,7 @@ impl Session {
                 .spawn(move || {
                     read_loop(reader, &event_tx, &mat_waiter, deliver_frames);
                     receiving.store(false, Ordering::SeqCst);
+                    drop(done_tx);
                 })?
         };
 
@@ -166,6 +177,8 @@ impl Session {
             stop_keepalive: None,
             keepalive: None,
             reader: Some(reader),
+            reader_done,
+            close_wait: CLOSE_WAIT,
             receiving,
             mat_waiter,
             mat_timeout: options.mat_timeout,
@@ -346,6 +359,13 @@ impl Session {
 
     /// Stop measuring, say goodbye and close the connection.
     ///
+    /// After the goodbye, only the sending direction is shut down, so the
+    /// device reads the end of the stream right after it. Events the device
+    /// still sends are read (and delivered to [`events`](Self::events)) until
+    /// it closes its end, for at most half a second, and only then does the
+    /// socket close. Data left unread at that point would make the socket
+    /// reset the connection rather than end it.
+    ///
     /// # Errors
     ///
     /// The first socket error while sending the goodbye packets or shutting
@@ -370,7 +390,14 @@ impl Session {
         }
         let ended = self.writer.send(Request::MatchEnded);
         let paused = self.writer.send(Request::AppPause);
-        let shut = self.writer.shutdown();
+        let shut = self.writer.shutdown_write();
+        let hung_up = shut.is_ok()
+            && self.reader_done.recv_timeout(self.close_wait) != Err(RecvTimeoutError::Timeout);
+        if !hung_up {
+            // The device keeps the connection open: stop reading. A reader
+            // blocked in a read then returns.
+            let _ = self.writer.shutdown();
+        }
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
@@ -428,12 +455,14 @@ fn keepalive_loop(writer: &PacketWriter, stop: &Receiver<()>, interval: Duration
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
     use std::time::Instant;
 
     use super::*;
-    use crate::testing::{MockConfig, MockDevice, ReceivedPacket};
+    use crate::error::Error;
+    use crate::testing::{MockConfig, MockDevice, ReceivedPacket, device_ack, device_event};
+    use crate::zmtp::{self, FrameReader};
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -551,5 +580,116 @@ mod tests {
         assert!(mock.wait_until(WAIT, |p| non_alive(p).len() >= before + 12));
         assert_eq!(non_alive(&mock.received())[before + 6..], round(Hand::Left));
         session.close().unwrap();
+    }
+
+    /// Plays the device through the handshake and the mat search, up to the
+    /// client's match begin, on one accepted connection.
+    fn device_until_measuring(listener: &TcpListener) -> (FrameReader<TcpStream>, TcpStream) {
+        let (stream, _) = listener.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut greeting = [0u8; 14];
+        (&stream).read_exact(&mut greeting).unwrap();
+        let mut identity = vec![0u8; usize::from(greeting[13])];
+        (&stream).read_exact(&mut identity).unwrap();
+        out.write_all(&zmtp::greeting(zmtp::SOCKET_ROUTER)).unwrap();
+        let mut frames = FrameReader::new(stream);
+        loop {
+            let body = frames.read_message().unwrap();
+            let packet: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            match (packet["PacketID"].as_str(), packet["Comment"].as_str()) {
+                (Some(id @ ("N_VERIFY_ID" | "N_REQ_CONNECT")), _) => {
+                    zmtp::write_frame(&mut out, &device_ack(id)).unwrap();
+                }
+                (_, Some("resyncToMat")) => {
+                    zmtp::write_frame(&mut out, &device_event("MatOK,102")).unwrap();
+                }
+                (_, Some("PM_API_MatchBegin")) => return (frames, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// The bodies the client sends until the end of its stream.
+    fn read_to_end(frames: &mut FrameReader<TcpStream>) -> Vec<String> {
+        let mut bodies = Vec::new();
+        loop {
+            match frames.read_message() {
+                Ok(body) => bodies.push(String::from_utf8(body).unwrap()),
+                Err(Error::Closed) => return bodies,
+                Err(e) => panic!("the client's stream ended with {e}"),
+            }
+        }
+    }
+
+    fn goodbye() -> Vec<String> {
+        [Request::MatchEnded, Request::AppPause]
+            .map(Request::to_json)
+            .to_vec()
+    }
+
+    fn quiet_options(port: u16) -> SessionOptions {
+        SessionOptions {
+            port,
+            mat_timeout: WAIT,
+            // No keepalive comes between the goodbye and the end of stream.
+            keepalive_interval: Duration::from_secs(3600),
+            ..SessionOptions::default()
+        }
+    }
+
+    /// The device reads the goodbye and then the end of the client's stream,
+    /// and can still send (as it does its heartbeats) until it closes its
+    /// own end: the client reads it, so the connection ends without a reset.
+    #[test]
+    fn close_ends_the_stream_after_the_goodbye_and_reads_until_the_device_hangs_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_tx, closed) = mpsc::channel::<()>();
+        let device = thread::spawn(move || {
+            let (mut frames, mut out) = device_until_measuring(&listener);
+            let received = read_to_end(&mut frames);
+            // Sent after the client's end of stream, so a client that has
+            // stopped reading holds it unread when it closes.
+            let wrote = zmtp::write_frame(&mut out, &device_event("Test,yy"));
+            let hung_up = out.shutdown(Shutdown::Write);
+            closed.recv().unwrap();
+            let reset = frames.get_ref().take_error().unwrap();
+            (received, wrote.is_ok() && hung_up.is_ok(), reset)
+        });
+
+        let mut session =
+            Session::start(IpAddr::V4(Ipv4Addr::LOCALHOST), &quiet_options(port)).unwrap();
+        // Long enough that only the device's hang-up ends the wait.
+        session.close_wait = WAIT;
+        session.close().unwrap();
+        closed_tx.send(()).unwrap();
+
+        let (received, sent_after, reset) = device.join().unwrap();
+        assert_eq!(received, goodbye());
+        assert!(sent_after, "the device could still send after the goodbye");
+        assert!(reset.is_none(), "the connection was reset: {reset:?}");
+    }
+
+    /// A device that keeps the connection open after the goodbye does not
+    /// hold the close past its wait.
+    #[test]
+    fn close_stops_reading_when_the_device_keeps_the_connection_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_tx, closed) = mpsc::channel::<()>();
+        let device = thread::spawn(move || {
+            let (mut frames, _out) = device_until_measuring(&listener);
+            let received = read_to_end(&mut frames);
+            // Holds its end open until the client's close has returned.
+            closed.recv().unwrap();
+            received
+        });
+
+        let mut session =
+            Session::start(IpAddr::V4(Ipv4Addr::LOCALHOST), &quiet_options(port)).unwrap();
+        session.close_wait = Duration::ZERO;
+        session.close().unwrap();
+        closed_tx.send(()).unwrap();
+        assert_eq!(device.join().unwrap(), goodbye());
     }
 }

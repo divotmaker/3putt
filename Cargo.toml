@@ -26,7 +26,7 @@ net = ["dep:socket2"]
 testing = []
 # `threeputt::config`: the driver's settings, with no network dependency.
 config = ["dep:flightrelay", "flightrelay/config"]
-# `threeputt::driver`: the flightrelay `DeviceDriver` for the ExPutt RG.
+# `threeputt::driver`: the flightrelay `FrpDriver` for the ExPutt RG.
 driver = ["config", "net", "flightrelay/driver"]
 # The `threeputt-frp` binary: the driver served to FRP controllers.
 frp = ["driver", "flightrelay/server", "flightrelay/main"]

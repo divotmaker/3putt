@@ -1,4 +1,4 @@
-//! The flightrelay `DeviceDriver` for the ExPutt RG (`driver` feature).
+//! The flightrelay `FrpDriver` for the ExPutt RG (`driver` feature).
 //!
 //! [`ExPutt`] finds the device on the network (or uses
 //! [`Config::address`]), starts a [`Session`] with the player's hand, and
@@ -12,7 +12,9 @@
 //!
 //! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
 //! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
-//! or drives it itself through the `DeviceDriver` contract.
+//! or drives it itself through the `FrpDriver` contract: each
+//! `step(now)` handles at most one device message, and every timer below
+//! runs on the `now` the host steps the session with.
 //!
 //! # Hints and actions
 //!
@@ -69,13 +71,13 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DeviceStatus, DriverInfo,
-    Events, Level, RawProfile, SessionEnd, ShotIds, Stopped, TurnHints,
+    Activity, Backoff, ConnectCtx, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver,
+    FrpSession, Level, RawProfile, SessionEnd, ShotIds, Stopped, TurnHints,
 };
 use flightrelay::{
     ClubData, FrpBody, Handedness, Launch, Mode, RawDir, RawFrame, Severity, ShotKey, Source,
@@ -117,9 +119,6 @@ const DISCOVERY_HINT_AFTER: Duration = Duration::from_secs(30);
 /// The alert raised once when discovery has not found the device.
 pub const DISCOVERY_HINT: &str = "ExPutt not found on this network. If it is on another network, \
      or a firewall blocks discovery, enter its IP address in the driver's address setting.";
-
-/// Longest wait for a device event in one poll.
-const EVENT_POLL: Duration = Duration::from_millis(100);
 
 /// How long the device may stay silent. It sends a heartbeat about once a
 /// second but can pause for a while, longer while it works out a putt, and its
@@ -208,7 +207,7 @@ impl From<Stopped> for Error {
     }
 }
 
-/// The ExPutt RG as a flightrelay `DeviceDriver`. See the [module docs](self).
+/// The ExPutt RG as a flightrelay `FrpDriver`. See the [module docs](self).
 #[derive(Debug)]
 pub struct ExPutt {
     config: Config,
@@ -223,14 +222,14 @@ pub struct ExPutt {
 
 #[cfg(feature = "testing")]
 impl ExPutt {
-    /// A driver with test timings instead of the device's ([`Tuning`]).
+    /// A driver with test ports and session timings instead of the
+    /// device's ([`Tuning`]).
     ///
     /// # Errors
     ///
     /// The [`ConfigError`] of a config that is not usable.
     pub fn with_tuning(config: Config, tuning: Tuning) -> Result<Self, ConfigError> {
-        let mut driver = <Self as DeviceDriver>::new(config)?;
-        driver.unanswered = Unanswered::new(tuning.not_answering_after);
+        let mut driver = <Self as FrpDriver>::new(config)?;
         driver.tuning = tuning;
         Ok(driver)
     }
@@ -245,7 +244,7 @@ impl ExPutt {
             .log(Level::Info, "looking for the ExPutt on the network...");
         ctx.out.phase("discovering");
         let listener = Listener::bind(self.tuning.discovery_port)?;
-        let started = Instant::now();
+        let started = ctx.now();
         let mut hinted = false;
         loop {
             ctx.tick()?;
@@ -264,13 +263,14 @@ impl ExPutt {
                 Err(crate::Error::Timeout(_)) => {}
                 Err(e) => return Err(e.into()),
             }
-            if !hinted && started.elapsed() >= self.tuning.discovery_hint_after {
+            let searched = ctx.now().saturating_duration_since(started);
+            if !hinted && searched >= DISCOVERY_HINT_AFTER {
                 hinted = true;
                 ctx.out.log(
                     Level::Info,
                     format!(
                         "no ExPutt found on the network after {}s",
-                        started.elapsed().as_secs()
+                        searched.as_secs()
                     ),
                 );
                 // Warn is the lowest alert severity.
@@ -278,9 +278,117 @@ impl ExPutt {
             }
         }
     }
+
+    /// Start a measuring session with the device at `ip` over the link
+    /// `start` opens with the hand and the raw tap (the TCP [`Session`], or a
+    /// test's channel).
+    fn open<L: Link>(
+        &mut self,
+        ctx: &mut ConnectCtx<'_>,
+        ip: IpAddr,
+        firmware: Option<String>,
+        start: impl FnOnce(&Tuning, Hand, Tap) -> crate::Result<L>,
+    ) -> Result<Measuring<L>, Error> {
+        ctx.out.phase("connecting");
+        let hand = hand_of(ctx.hints().handedness);
+        ctx.out.log(
+            Level::Info,
+            format!("connecting to the ExPutt at {ip} ({hand:?} hand)..."),
+        );
+        ctx.tick()?;
+        let (raw, raw_rx) = RawTap::new();
+        raw.want(ctx.out.wants_raw() || ctx.out.enabled(Level::Trace));
+        // The session's own mat search runs inside `start`.
+        let resync_started = ctx.now();
+        let link = start(&self.tuning, hand, raw.tap())?;
+        self.totals.connects.fetch_add(1, Ordering::Relaxed);
+        self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
+
+        let name = format!("{MODEL} ({ip})");
+        ctx.out
+            .log(Level::Info, format!("connected to the {name}, measuring"));
+        let mut identity = DeviceIdentity::new(name.clone())
+            .with_model(MODEL)
+            .with_label(name);
+        if let Some(firmware) = firmware {
+            identity = identity.with_firmware(firmware);
+        }
+        let now = ctx.now();
+        let mut session = Measuring {
+            link,
+            identity,
+            ids: self.ids.clone(),
+            raw,
+            raw_rx,
+            watchdog: Watchdog::new(SILENCE, now),
+            gate: ResyncGate::new(RESYNC_GAP, hand, now),
+            device_ready: "false",
+            silent: false,
+            mat_search: Some((resync_started, true)),
+            published: HashMap::new(),
+            struck_at: None,
+            hold_to_log: false,
+            totals: Arc::clone(&self.totals),
+        };
+        // A handedness hint that arrived while the session started is a
+        // request like any other. After a stop, dropping the session closes
+        // it.
+        ctx.tick()?;
+        if let Some(handed) = ctx.hints().handedness {
+            session.gate.want_hand(hand_of(Some(handed)));
+            session.hold_to_log = true;
+        }
+        ctx.out.phase("measuring");
+        Ok(session)
+    }
+
+    /// [`FrpDriver::retry_delay`] at `now`, which dates an attempt the
+    /// device did not answer.
+    fn retry_delay_at(
+        &mut self,
+        ended: &SessionEnd<'_, Error>,
+        backoff: &mut Backoff,
+        out: &mut Events<'_>,
+        now: Instant,
+    ) -> Duration {
+        let Some(error) = ended.error else {
+            return backoff.delay(ended.connected_for);
+        };
+        // A stop is no failure: no alert, and the reconnect policy stays.
+        if matches!(error, Error::Stopped) {
+            return backoff.delay(ended.connected_for);
+        }
+
+        // A device that accepts the connection and never answers is not
+        // hammered (see `Retry`); the user is told once, and the per-attempt
+        // alerts stop until a session succeeds.
+        let mut tell_not_answering = false;
+        if ended.connected_for.is_some() {
+            self.unanswered.recovered();
+        } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
+            tell_not_answering = self.unanswered.no_answer(now);
+        }
+        if !self.unanswered.told {
+            out.alert(Severity::Warn, format!("ExPutt error: {error}"));
+        }
+        if tell_not_answering {
+            out.log(
+                Level::Warn,
+                format!(
+                    "no answer from the device to {} s of connection attempts",
+                    self.unanswered.after.as_secs()
+                ),
+            );
+            out.alert(Severity::Warn, NOT_ANSWERING);
+        }
+
+        let silent = matches!(error, Error::Silent(_));
+        self.retry
+            .delay(backoff, ended.connected_for, silent, STALL_RECONNECT_WAIT)
+    }
 }
 
-impl DeviceDriver for ExPutt {
+impl FrpDriver for ExPutt {
     type Config = Config;
     type Error = Error;
     type Action = Action;
@@ -303,7 +411,7 @@ impl DeviceDriver for ExPutt {
             config,
             ip,
             ids: ShotIds::new(),
-            unanswered: Unanswered::new(tuning.not_answering_after),
+            unanswered: Unanswered::new(NOT_ANSWERING_AFTER),
             tuning,
             retry: Retry::default(),
             totals: Arc::new(Totals::default()),
@@ -331,58 +439,10 @@ impl DeviceDriver for ExPutt {
             let beacon = self.discover(ctx)?;
             (beacon.ip, beacon.app_version)
         };
-
-        ctx.out.phase("connecting");
-        let hand = hand_of(ctx.hints().handedness);
-        ctx.out.log(
-            Level::Info,
-            format!("connecting to the ExPutt at {ip} ({hand:?} hand)..."),
-        );
-        ctx.tick()?;
-        let (raw, raw_rx) = RawTap::new();
-        raw.want(ctx.out.wants_raw() || ctx.out.enabled(Level::Trace));
-        // The session's own mat search runs inside `start`.
-        let resync_started = Instant::now();
-        let session = Session::start_tapped(ip, &self.tuning.session_options(hand), raw.tap())?;
-        self.totals.connects.fetch_add(1, Ordering::Relaxed);
-        self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
-
-        let name = format!("{MODEL} ({ip})");
-        ctx.out
-            .log(Level::Info, format!("connected to the {name}, measuring"));
-        let mut identity = DeviceIdentity::new(name.clone())
-            .with_model(MODEL)
-            .with_label(name);
-        if let Some(firmware) = firmware {
-            identity = identity.with_firmware(firmware);
-        }
-        let now = Instant::now();
-        let mut session = ExPuttSession {
-            session,
-            identity,
-            ids: self.ids.clone(),
-            raw,
-            raw_rx,
-            watchdog: Watchdog::new(self.tuning.silence(), now),
-            gate: ResyncGate::new(self.tuning.resync_gap, hand, now),
-            device_ready: "false",
-            silent: false,
-            mat_search: Some((resync_started, true)),
-            published: HashMap::new(),
-            struck_at: None,
-            hold_to_log: false,
-            totals: Arc::clone(&self.totals),
-        };
-        // A handedness hint that arrived while the session started is a
-        // request like any other. After a stop, dropping the session closes
-        // it.
-        ctx.tick()?;
-        if let Some(handed) = ctx.hints().handedness {
-            session.gate.want_hand(hand_of(Some(handed)));
-            session.hold_to_log = true;
-        }
-        ctx.out.phase("measuring");
-        Ok(session)
+        self.open(ctx, ip, firmware, |tuning, hand, tap| {
+            Session::start_tapped(ip, &tuning.session_options(hand), tap)
+        })
+        .map(ExPuttSession)
     }
 
     /// The device's own reconnect policy: the host's backoff, shortened for
@@ -396,49 +456,46 @@ impl DeviceDriver for ExPutt {
         backoff: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        let Some(error) = ended.error else {
-            return Some(backoff.delay(ended.connected_for));
-        };
-        // A stop is no failure: no alert, and the reconnect policy stays.
-        if matches!(error, Error::Stopped) {
-            return Some(backoff.delay(ended.connected_for));
-        }
-
-        // A device that accepts the connection and never answers is not
-        // hammered (see `Retry`); the user is told once, and the per-attempt
-        // alerts stop until a session succeeds.
-        let mut tell_not_answering = false;
-        if ended.connected_for.is_some() {
-            self.unanswered.recovered();
-        } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
-            tell_not_answering = self.unanswered.no_answer(Instant::now());
-        }
-        if !self.unanswered.told {
-            out.alert(Severity::Warn, format!("ExPutt error: {error}"));
-        }
-        if tell_not_answering {
-            out.log(
-                Level::Warn,
-                format!(
-                    "no answer from the device to {} s of connection attempts",
-                    self.unanswered.after.as_secs()
-                ),
-            );
-            out.alert(Severity::Warn, NOT_ANSWERING);
-        }
-
-        let silent = matches!(error, Error::Silent(_));
-        Some(
-            self.retry
-                .delay(backoff, ended.connected_for, silent, self.tuning.stall_wait),
-        )
+        Some(self.retry_delay_at(ended, backoff, out, Instant::now()))
     }
 }
 
 /// A measuring session with the ExPutt. See the [module docs](self).
 #[derive(Debug)]
-pub struct ExPuttSession {
-    session: Session,
+pub struct ExPuttSession(Measuring<Session>);
+
+/// What the driver uses of a session with the device: its events, the mat
+/// searches, and the close. The TCP [`Session`]; a channel in tests.
+trait Link {
+    /// The device's events; disconnected once the device is gone.
+    fn events(&self) -> &Receiver<Event>;
+    fn find_mat(&self) -> crate::Result<()>;
+    fn restart_match(&self, hand: Hand) -> crate::Result<()>;
+    fn close(self) -> crate::Result<()>;
+}
+
+impl Link for Session {
+    fn events(&self) -> &Receiver<Event> {
+        Session::events(self)
+    }
+
+    fn find_mat(&self) -> crate::Result<()> {
+        Session::find_mat(self)
+    }
+
+    fn restart_match(&self, hand: Hand) -> crate::Result<()> {
+        Session::restart_match(self, hand)
+    }
+
+    fn close(self) -> crate::Result<()> {
+        Session::close(self)
+    }
+}
+
+/// The session behind [`ExPuttSession`], over any [`Link`].
+#[derive(Debug)]
+struct Measuring<L> {
+    link: L,
     identity: DeviceIdentity,
     ids: ShotIds,
     raw: RawTap,
@@ -459,13 +516,13 @@ pub struct ExPuttSession {
     /// When the ball was struck (UTC ms), until the putt's result or the
     /// device is ready again.
     struck_at: Option<u64>,
-    /// A hint or action asked for a mat search since the last poll, which
+    /// A hint or action asked for a mat search since the last step, which
     /// logs whether it is held back.
     hold_to_log: bool,
     totals: Arc<Totals>,
 }
 
-impl ExPuttSession {
+impl<L: Link> Measuring<L> {
     /// Set `key` to `value`; whether that changed anything.
     fn set(&mut self, key: &'static str, value: &'static str) -> bool {
         self.published.insert(key, value) != Some(value)
@@ -506,8 +563,8 @@ impl ExPuttSession {
     }
 
     /// Logs how long a requested mat search is held back, if it is.
-    fn log_hold(&self, out: &mut Events<'_>) {
-        if let Some(left) = self.gate.hold(Instant::now()) {
+    fn log_hold(&self, out: &mut Events<'_>, now: Instant) {
+        if let Some(left) = self.gate.hold(now) {
             out.log(
                 Level::Info,
                 format!(
@@ -575,9 +632,10 @@ impl ExPuttSession {
         out.shot_finished(key);
     }
 
-    /// A device event: the watchdog, then readiness and the device state.
-    fn handle(&mut self, out: &mut Events<'_>, event: Event) {
-        if let Some(spell) = self.watchdog.event(&event, Instant::now()) {
+    /// A device event at `now`: the watchdog, then readiness and the device
+    /// state.
+    fn handle(&mut self, out: &mut Events<'_>, event: Event, now: Instant) {
+        if let Some(spell) = self.watchdog.event(&event, now) {
             self.silent = false;
             out.log(
                 Level::Info,
@@ -591,7 +649,7 @@ impl ExPuttSession {
         let (ready, device_state) = match event {
             Event::FindingMat => (None, Some("finding mat")),
             Event::MatFound => {
-                self.log_mat_found(out);
+                self.log_mat_found(out, now);
                 (None, Some("mat found"))
             }
             Event::PuttReady => {
@@ -627,11 +685,11 @@ impl ExPuttSession {
         self.report(out, device_state);
     }
 
-    fn log_mat_found(&mut self, out: &mut Events<'_>) {
+    fn log_mat_found(&mut self, out: &mut Events<'_>, now: Instant) {
         let Some((started, at_start)) = self.mat_search.take() else {
             return;
         };
-        let took = started.elapsed();
+        let took = now.saturating_duration_since(started);
         if at_start {
             out.log(
                 Level::Info,
@@ -658,9 +716,9 @@ impl ExPuttSession {
         }
     }
 
-    /// No event within the poll: the watchdog decides.
-    fn quiet(&mut self, out: &mut Events<'_>) -> Result<(), Error> {
-        match self.watchdog.check(Instant::now()) {
+    /// No event waiting at `now`: the watchdog decides.
+    fn quiet(&mut self, out: &mut Events<'_>, now: Instant) -> Result<(), Error> {
+        match self.watchdog.check(now) {
             Quiet::Fine => Ok(()),
             Quiet::Warn(quiet) => {
                 out.log(
@@ -693,28 +751,25 @@ impl ExPuttSession {
             }
         }
     }
-}
 
-impl DeviceSession for ExPuttSession {
-    type Driver = ExPutt;
-
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
+    /// One pass: a mat search that is due, then at most one device event
+    /// (`Activity::Active`), or the watchdog when none is waiting (`Activity::Idle`).
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.raw.want(out.wants_raw() || out.enabled(Level::Trace));
         if std::mem::take(&mut self.hold_to_log) {
-            self.log_hold(out);
+            self.log_hold(out, now);
         }
 
         // A mat search runs at most once per gap, with the latest hand.
-        let now = Instant::now();
         if let Some(search) = self.gate.due(now) {
             match search {
                 Resync::Restart(hand) => {
                     out.log(Level::Info, format!("hand -> {hand:?}, finding the mat"));
-                    self.session.restart_match(hand)?;
+                    self.link.restart_match(hand)?;
                 }
                 Resync::Find => {
                     out.log(Level::Info, "finding the mat");
-                    self.session.find_mat()?;
+                    self.link.find_mat()?;
                 }
             }
             self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
@@ -723,13 +778,14 @@ impl DeviceSession for ExPuttSession {
         }
         self.report(out, None);
 
-        let event = match self.session.events().recv_timeout(timeout.min(EVENT_POLL)) {
+        let event = match self.link.events().try_recv() {
             Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => {
+            Err(TryRecvError::Empty) => {
                 self.drain_raw(out, None);
-                return self.quiet(out);
+                self.quiet(out, now)?;
+                return Ok(Activity::Idle);
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(TryRecvError::Disconnected) => {
                 self.drain_raw(out, None);
                 out.log(Level::Info, "device closed the connection");
                 return Err(Error::Lost);
@@ -740,8 +796,43 @@ impl DeviceSession for ExPuttSession {
         if !matches!(event, Event::PuttResult(_)) {
             self.drain_raw(out, None);
         }
-        self.handle(out, event);
-        Ok(())
+        self.handle(out, event, now);
+        Ok(Activity::Active)
+    }
+
+    fn hints(&mut self, hints: TurnHints) {
+        if let Some(handed) = hints.handedness {
+            self.gate.want_hand(hand_of(Some(handed)));
+            self.hold_to_log = true;
+        }
+    }
+
+    fn action(&mut self, action: Action) {
+        match action {
+            Action::FindMat => {
+                self.gate.want_find();
+                self.hold_to_log = true;
+            }
+        }
+    }
+
+    fn close(self, out: &mut Events<'_>) {
+        if self.gate.pending() {
+            out.log(Level::Debug, "mat search request dropped at shutdown");
+        }
+        out.log(Level::Info, "closing the session");
+        out.status(DeviceStatus::not_armed());
+        if let Err(e) = self.link.close() {
+            out.log(Level::Debug, format!("session close: {e}"));
+        }
+    }
+}
+
+impl FrpSession for ExPuttSession {
+    type Driver = ExPutt;
+
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+        self.0.step(now, out)
     }
 
     /// Follow the golfer's handedness: a new round when it differs from the
@@ -749,36 +840,21 @@ impl DeviceSession for ExPuttSession {
     /// until it reports ready again. No handedness hint keeps the hand. The
     /// mode and the club do not apply: the device only measures putts.
     fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
-        if let Some(handed) = hints.handedness {
-            self.gate.want_hand(hand_of(Some(handed)));
-            self.hold_to_log = true;
-        }
+        self.0.hints(*hints);
         Ok(())
     }
 
     fn action(&mut self, action: &Action) -> Result<(), Error> {
-        match action {
-            Action::FindMat => {
-                self.gate.want_find();
-                self.hold_to_log = true;
-            }
-        }
+        self.0.action(*action);
         Ok(())
     }
 
     fn identity(&self) -> &DeviceIdentity {
-        &self.identity
+        &self.0.identity
     }
 
     fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
-        if self.gate.pending() {
-            out.log(Level::Debug, "mat search request dropped at shutdown");
-        }
-        out.log(Level::Info, "closing the session");
-        out.status(DeviceStatus::not_armed());
-        if let Err(e) = self.session.close() {
-            out.log(Level::Debug, format!("session close: {e}"));
-        }
+        self.0.close(out);
         Ok(())
     }
 }

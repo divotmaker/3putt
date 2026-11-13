@@ -270,8 +270,19 @@ impl PacketWriter {
     ///
     /// Socket errors, [`Error::Poisoned`].
     pub fn shutdown(&self) -> Result<()> {
+        self.shutdown_how(Shutdown::Both)
+    }
+
+    /// Shut down the sending direction only: the device reads the end of
+    /// the stream after what was sent, and receiving goes on until the
+    /// device closes its end.
+    pub(crate) fn shutdown_write(&self) -> Result<()> {
+        self.shutdown_how(Shutdown::Write)
+    }
+
+    fn shutdown_how(&self, how: Shutdown) -> Result<()> {
         let stream = self.stream.lock().map_err(|_| Error::Poisoned)?;
-        match stream.shutdown(Shutdown::Both) {
+        match stream.shutdown(how) {
             Err(e) if e.kind() != std::io::ErrorKind::NotConnected => Err(Error::Io(e)),
             _ => Ok(()),
         }

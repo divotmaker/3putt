@@ -1,6 +1,7 @@
 use super::*;
 
 const PUTT_RESULT_FULL: &str = "PuttResult,1.43502296839333,2.50345148852703,1531.8,1.50199074589741,0.55270159796981,1.48146093525773,105,101,101,201,400,599,2.15371070126487,1.48146093525773,1.3619127672204,51";
+const PUTT_RESULT_PULLED: &str = "PuttResult,-10.2790290384019,3.789423622279,965.7,2.04021538616595,-5.16989038221816,-10.5479310729379,90,105,123,166,365,563,-12.8369117616901,-10.5479310729379,-13.4288407664039,51";
 const PUTT_RESULT_BALL_ONLY: &str = "PuttResult,0.561243876918884,1.80518847921913,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999";
 
 fn device_event(comment: &str) -> Vec<u8> {
@@ -319,51 +320,6 @@ fn the_user_is_told_once_per_outage_that_the_device_is_not_answering() {
     assert!(u.no_answer(at(120)));
 }
 
-/// How `retry_delay` uses the outage tracker and the stall wait. The user
-/// is told at the first unanswered attempt here, so no time has to pass.
-#[test]
-fn an_outage_is_told_once_and_its_later_attempts_raise_no_alert() {
-    let mut driver = ExPutt::new(Config::default()).unwrap();
-    driver.unanswered = Unanswered::new(Duration::ZERO);
-    let mut backoff = Backoff::default();
-    let unanswered = Error::Device(crate::Error::Timeout("the device's reply"));
-    let refused = Error::Device(crate::Error::Closed);
-    let none = Vec::<String>::new();
-
-    // An attempt that fails some other way is alerted on its own.
-    let (_, alerts) = retry_after(&mut driver, Some(&refused), None, &mut backoff);
-    assert_eq!(alerts, [format!("ExPutt error: {refused}")]);
-    // At the unanswered one the user is told.
-    let (_, alerts) = retry_after(&mut driver, Some(&unanswered), None, &mut backoff);
-    assert_eq!(alerts, [NOT_ANSWERING]);
-    // While the outage lasts no attempt is alerted, refused ones included,
-    // and the user is not told again.
-    for error in [&unanswered, &refused, &unanswered] {
-        let (_, alerts) = retry_after(&mut driver, Some(error), None, &mut backoff);
-        assert_eq!(alerts, none, "{error}");
-    }
-    // A session that measured ends the outage: the next one is told again.
-    let (_, alerts) = retry_after(
-        &mut driver,
-        Some(&Error::Lost),
-        Some(Duration::from_secs(2)),
-        &mut backoff,
-    );
-    assert_eq!(alerts, ["ExPutt error: connection to the device lost"]);
-    let (_, alerts) = retry_after(&mut driver, Some(&unanswered), None, &mut backoff);
-    assert_eq!(alerts, [NOT_ANSWERING]);
-
-    // A session lost to silence is followed by the stall wait.
-    let silent = Error::Silent(Duration::from_secs(90));
-    let (delay, _) = retry_after(
-        &mut driver,
-        Some(&silent),
-        Some(Duration::from_secs(300)),
-        &mut backoff,
-    );
-    assert_eq!(delay, Some(Tuning::default().stall_wait));
-}
-
 #[test]
 fn a_putt_is_a_launch_without_elevation_or_spin() {
     let launch = launch_of(&putt(PUTT_RESULT_FULL));
@@ -383,6 +339,12 @@ fn a_putt_is_a_launch_without_elevation_or_spin() {
     assert_eq!(club.face_angle, Some(1.481_460_935_257_73));
     assert_eq!(club.club_speed, None, "the putter speed is not used");
     assert_eq!(club_of(&putt(PUTT_RESULT_BALL_ONLY)), None);
+
+    // A pulled putt: launch, path and face negative, left of the line.
+    let pulled = putt(PUTT_RESULT_PULLED);
+    assert!(launch_of(&pulled).launch_azimuth.unwrap() < -10.0);
+    let club = club_of(&pulled).expect("putter tracked");
+    assert!(club.path.unwrap() < -5.0 && club.face_angle.unwrap() < -10.0);
 }
 
 #[test]
@@ -468,3 +430,4 @@ mod cli {
 
 #[cfg(feature = "testing")]
 mod live;
+mod stepped;
