@@ -48,6 +48,13 @@ pub fn device_event(comment: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The greeting the device sends first on every connection, before any
+/// message: for a test device that accepts connections and never answers.
+#[must_use]
+pub fn device_greeting() -> Vec<u8> {
+    zmtp::greeting(zmtp::SOCKET_ROUTER)
+}
+
 /// JSON body of the device's `N_OK` reply to `request_packet_id`.
 #[must_use]
 pub fn device_ack(request_packet_id: &str) -> Vec<u8> {
@@ -103,6 +110,7 @@ impl Default for MockConfig {
 
 /// A packet the mock device received from the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReceivedPacket {
     /// `PacketID`.
     pub packet_id: String,

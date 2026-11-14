@@ -184,6 +184,7 @@ struct Incoming {
 ///
 /// The result has no roll distance.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct PuttResult {
     /// Launch direction in degrees, positive to the right.
     pub launch_direction_deg: f64,

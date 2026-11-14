@@ -56,25 +56,27 @@
 //! # }
 //! ```
 
-pub mod beacon;
+#![warn(missing_docs)]
+
+mod beacon;
 #[cfg(feature = "config")]
 pub mod config;
-pub mod conn;
+mod conn;
 #[cfg(feature = "driver")]
 pub mod driver;
-pub mod error;
-pub mod event;
-pub mod packet;
-pub mod session;
+mod error;
+mod event;
+mod packet;
+mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
-pub mod zmtp;
+mod zmtp;
 
 #[cfg(feature = "net")]
 pub use beacon::discover;
 pub use beacon::{Beacon, DEVICE_PORT, DISCOVERY_PORT};
 pub use conn::{Connection, EventReader, PacketWriter};
 pub use error::{Error, Result};
-pub use event::{Event, NOT_MEASURED, PuttResult};
+pub use event::{Event, NOT_MEASURED, PUTT_RESULT_FIELDS, PuttResult};
 pub use packet::{Hand, Request};
 pub use session::{Session, SessionOptions};

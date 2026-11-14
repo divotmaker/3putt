@@ -16,7 +16,7 @@
 //! Flag bit `0x01` (MORE) marks a multipart message. This client never sends
 //! one; on input the parts are concatenated into one body.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 use crate::error::{Error, Result};
 
@@ -30,6 +30,7 @@ pub const REVISION: u8 = 0x01;
 pub const SOCKET_DEALER: u8 = 0x05;
 
 /// Socket type of the device (`ROUTER`).
+#[cfg(any(test, feature = "testing"))]
 pub const SOCKET_ROUTER: u8 = 0x06;
 
 /// Largest frame body accepted. Camera frames are around 100 KB; anything
@@ -196,7 +197,8 @@ impl<R: Read> FrameReader<R> {
 /// # Errors
 ///
 /// I/O errors from the stream.
-pub fn write_frame<W: Write>(out: &mut W, body: &[u8]) -> io::Result<()> {
+#[cfg(feature = "testing")]
+pub fn write_frame<W: io::Write>(out: &mut W, body: &[u8]) -> io::Result<()> {
     out.write_all(&encode_frame(body))?;
     out.flush()
 }

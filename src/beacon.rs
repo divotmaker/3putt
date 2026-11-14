@@ -30,6 +30,7 @@ pub const DEVICE_PORT: u16 = 8889;
 
 /// A discovery beacon.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Beacon {
     /// Device address: the advertised `_ipAddress`, or the datagram's source
     /// address if that is missing or invalid.

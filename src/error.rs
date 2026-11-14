@@ -26,7 +26,7 @@ pub enum Error {
     #[error("unexpected greeting from the device: {0}")]
     Greeting(&'static str),
 
-    /// A frame header announced a body larger than [`MAX_FRAME_LEN`](crate::zmtp::MAX_FRAME_LEN).
+    /// A frame header announced a body larger than the 16 MiB limit.
     #[error("the device sent a {0}-byte message, over the size limit")]
     FrameTooLarge(u64),
 
