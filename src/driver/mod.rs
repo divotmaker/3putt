@@ -67,7 +67,6 @@
 
 mod tuning;
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -322,10 +321,10 @@ impl ExPutt {
             raw_rx,
             watchdog: Watchdog::new(SILENCE, now),
             gate: ResyncGate::new(RESYNC_GAP, hand, now),
-            device_ready: "false",
+            device_ready: false,
+            device_state: None,
             silent: false,
             mat_search: Some((resync_started, true)),
-            published: HashMap::new(),
             struck_at: None,
             hold_to_log: false,
             totals: Arc::clone(&self.totals),
@@ -502,17 +501,17 @@ struct Measuring<L> {
     raw_rx: Receiver<Message>,
     watchdog: Watchdog,
     gate: ResyncGate,
-    /// The last `ready` the device itself reported; what is published also
-    /// depends on a waiting mat search and on silence.
-    device_ready: &'static str,
+    /// The last `ready` the device itself reported; the status also depends
+    /// on a waiting mat search and on silence.
+    device_ready: bool,
+    /// The last state the device reported, the `device_state` telemetry.
+    device_state: Option<&'static str>,
     /// The device has been silent past the warning threshold; not ready as
     /// published until it sends something again.
     silent: bool,
     /// The mat search in progress, when it started, and whether it is the
     /// session's own (whose time includes connect and handshake).
     mat_search: Option<(Instant, bool)>,
-    /// Status as last reported: `ready` and `device_state`.
-    published: HashMap<&'static str, &'static str>,
     /// When the ball was struck (UTC ms), until the putt's result or the
     /// device is ready again.
     struck_at: Option<u64>,
@@ -523,41 +522,19 @@ struct Measuring<L> {
 }
 
 impl<L: Link> Measuring<L> {
-    /// Set `key` to `value`; whether that changed anything.
-    fn set(&mut self, key: &'static str, value: &'static str) -> bool {
-        self.published.insert(key, value) != Some(value)
-    }
-
-    /// `ready` as published: not ready while a requested mat search is waiting
-    /// or the device has been silent past the warning threshold.
-    fn published_ready(&self) -> &'static str {
-        if self.silent || self.gate.pending() {
-            "false"
-        } else {
-            self.device_ready
-        }
-    }
-
-    /// Report `ready` (as the blockers: none, or `not_armed`) and
-    /// `device_state` (telemetry, when given), each only if it changed. What
-    /// goes out is the whole status: the device has no battery or attitude,
-    /// and `device_state` is the last state it reported.
-    fn report(&mut self, out: &mut Events<'_>, device_state: Option<&'static str>) {
-        let ready = self.published_ready();
-        let mut changed = self.set("ready", ready);
-        if let Some(state) = device_state {
-            changed |= self.set("device_state", state);
-        }
-        if !changed {
-            return;
-        }
-        let mut status = if ready == "true" {
+    /// Report the status: the `not_armed` blocker unless the device is ready
+    /// (it is not while a requested mat search waits or past the silence
+    /// warning), and `device_state`. That is the whole status: the device
+    /// has no battery or attitude. The host publishes only what changed.
+    fn report(&self, out: &mut Events<'_>) {
+        let ready = self.device_ready && !self.silent && !self.gate.pending();
+        let mut status = if ready {
             DeviceStatus::new()
         } else {
             DeviceStatus::not_armed()
         };
-        if let Some(state) = self.published.get("device_state") {
-            status = status.with_telemetry("device_state", *state);
+        if let Some(state) = self.device_state {
+            status = status.with_telemetry("device_state", state);
         }
         out.status(status);
     }
@@ -633,9 +610,10 @@ impl<L: Link> Measuring<L> {
     }
 
     /// A device event at `now`: the watchdog, then readiness and the device
-    /// state.
+    /// state, reported when the event or the end of a silence moved either.
     fn handle(&mut self, out: &mut Events<'_>, event: Event, now: Instant) {
-        if let Some(spell) = self.watchdog.event(&event, now) {
+        let spell = self.watchdog.event(&event, now);
+        if let Some(spell) = spell {
             self.silent = false;
             out.log(
                 Level::Info,
@@ -655,12 +633,12 @@ impl<L: Link> Measuring<L> {
             Event::PuttReady => {
                 out.log(Level::Info, "ready for a putt");
                 self.struck_at = None;
-                (Some("true"), Some("ready"))
+                (Some(true), Some("ready"))
             }
             Event::BallStruck => {
                 out.log(Level::Info, "ball struck");
                 self.struck_at = utc_ms();
-                (Some("false"), Some("ball struck"))
+                (Some(false), Some("ball struck"))
             }
             Event::Heartbeat => (None, None),
             Event::PuttResult(putt) => {
@@ -679,10 +657,12 @@ impl<L: Link> Measuring<L> {
                 (None, None)
             }
         };
-        if let Some(ready) = ready {
-            self.device_ready = ready;
+        if ready.is_none() && device_state.is_none() && spell.is_none() {
+            return;
         }
-        self.report(out, device_state);
+        self.device_ready = ready.unwrap_or(self.device_ready);
+        self.device_state = device_state.or(self.device_state);
+        self.report(out);
     }
 
     fn log_mat_found(&mut self, out: &mut Events<'_>, now: Instant) {
@@ -733,7 +713,7 @@ impl<L: Link> Measuring<L> {
                     ),
                 );
                 self.silent = true;
-                self.report(out, None);
+                self.report(out);
                 Ok(())
             }
             Quiet::Lost(quiet) => {
@@ -779,9 +759,9 @@ impl<L: Link> FrpSession for Measuring<L> {
             }
             self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
             self.mat_search = Some((now, false));
-            self.device_ready = "false";
+            self.device_ready = false;
+            self.report(out);
         }
-        self.report(out, None);
 
         let event = match self.link.events().try_recv() {
             Ok(event) => event,
@@ -809,21 +789,23 @@ impl<L: Link> FrpSession for Measuring<L> {
     /// device's hand, which finds the mat first, so the device is not ready
     /// until it reports ready again. No handedness hint keeps the hand. The
     /// mode and the club do not apply: the device only measures putts.
-    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), Error> {
+    fn hints(&mut self, hints: &TurnHints, out: &mut Events<'_>) -> Result<(), Error> {
         if let Some(handed) = hints.handedness {
             self.gate.want_hand(hand_of(Some(handed)));
             self.hold_to_log = true;
+            self.report(out);
         }
         Ok(())
     }
 
-    fn action(&mut self, action: &Action, _: &mut Events<'_>) -> Result<(), Error> {
+    fn action(&mut self, action: &Action, out: &mut Events<'_>) -> Result<(), Error> {
         match action {
             Action::FindMat => {
                 self.gate.want_find();
                 self.hold_to_log = true;
             }
         }
+        self.report(out);
         Ok(())
     }
 
@@ -836,7 +818,6 @@ impl<L: Link> FrpSession for Measuring<L> {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
         out.log(Level::Info, "closing the session");
-        out.status(DeviceStatus::not_armed());
         if let Err(e) = self.link.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }

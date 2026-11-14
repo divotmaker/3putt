@@ -225,7 +225,11 @@ fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
     assert_eq!(s.identity.firmware, None);
 
     settle(&mut host, &mut s);
-    assert_eq!(states(&host.take()), [(false, None)]);
+    assert_eq!(
+        states(&host.take()),
+        [],
+        "the host starts a session not armed"
+    );
     device.send("MatOK,102");
     device.send(PUTT_READY);
     settle(&mut host, &mut s);
@@ -239,7 +243,6 @@ fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
     ));
 
     host.with(|_, out| s.close(out)).expect("close");
-    assert_eq!(ready(&host.take()), Some(false), "not ready after close");
     assert_eq!(device.sent(), [Sent::Close]);
 }
 
@@ -371,7 +374,6 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
     let seen = host.take();
     assert_eq!(shot(&seen).len(), 4, "the putt before the close went out");
     assert!(logged(&seen, Level::Info, "device closed the connection"));
-    assert_eq!(ready(&seen), Some(false));
 
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let delay = host.with(|now, out| {
@@ -524,7 +526,11 @@ fn the_hand_follows_the_player_one_round_per_gap() {
     host.advance(Duration::from_secs(2));
     settle(&mut host, &mut s);
     let seen = host.take();
-    assert_eq!(device_states(&seen), ["finding mat", "mat found", "ready"]);
+    // The restart reports not ready with the state the device last sent.
+    assert_eq!(
+        device_states(&seen),
+        ["ready", "finding mat", "mat found", "ready"]
+    );
     assert_eq!(ready(&seen), Some(true));
     assert!(logged(&seen, Level::Info, "mat found after 2.0s"));
 
@@ -533,7 +539,7 @@ fn the_hand_follows_the_player_one_round_per_gap() {
         .expect("hints");
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
     assert_eq!(device.sent(), []);
-    assert_eq!(states(&host.take()), []);
+    assert!(states(&host.take()).iter().all(|(ready, _)| *ready));
 }
 
 /// A hand change inside the gap is held, not ready meanwhile; a change back
