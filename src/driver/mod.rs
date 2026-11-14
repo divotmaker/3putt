@@ -72,7 +72,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
@@ -81,7 +81,7 @@ use flightrelay::driver::{
 };
 use flightrelay::{
     ClubData, FrpBody, Handedness, Launch, Mode, RawDir, RawFrame, Severity, ShotKey, Source,
-    Velocity,
+    Velocity, utc_ms,
 };
 use serde::Deserialize;
 
@@ -584,19 +584,19 @@ impl<L: Link> Measuring<L> {
                 Direction::Rx => RawDir::Rx,
                 Direction::Tx => RawDir::Tx,
             };
-            match classify(message.dir, &message.body) {
-                Frame::Shared(label) if out.wants_raw() => {
-                    let key = putt.filter(|_| label == PUTT_RESULT_LABEL).cloned();
-                    out.frp(FrpBody::ShotRaw(RawFrame {
-                        timestamp: message.at,
-                        label: Some(label.to_owned()),
-                        key,
-                        ..RawFrame::new(dir, 0, message.body)
-                    }));
-                }
-                Frame::Shared(label) | Frame::Private(label) => {
-                    out.audit(dir, label, &message.body);
-                }
+            let (label, private) = match classify(message.dir, &message.body) {
+                Frame::Shared(label) => (label, false),
+                Frame::Private(label) => (label, true),
+            };
+            let raw = out.wants_raw() && !private;
+            match putt.filter(|_| raw && label == PUTT_RESULT_LABEL) {
+                Some(key) => out.frp(FrpBody::ShotRaw(RawFrame {
+                    timestamp: message.at,
+                    label: Some(label.to_owned()),
+                    key: Some(key.clone()),
+                    ..RawFrame::new(dir, 0, message.body)
+                })),
+                None => out.wire(dir, label, message.body, message.at, !raw),
             }
         }
     }
@@ -659,7 +659,7 @@ impl<L: Link> Measuring<L> {
             }
             Event::BallStruck => {
                 out.log(Level::Info, "ball struck");
-                self.struck_at = now_ms();
+                self.struck_at = utc_ms();
                 (Some("false"), Some("ball struck"))
             }
             Event::Heartbeat => (None, None),
@@ -751,6 +751,11 @@ impl<L: Link> Measuring<L> {
             }
         }
     }
+}
+
+impl<L: Link> FrpSession for Measuring<L> {
+    type Error = Error;
+    type Action = Action;
 
     /// One pass: a mat search that is due, then at most one device event
     /// (`Activity::Active`), or the watchdog when none is waiting (`Activity::Idle`).
@@ -800,23 +805,33 @@ impl<L: Link> Measuring<L> {
         Ok(Activity::Active)
     }
 
-    fn hints(&mut self, hints: TurnHints) {
+    /// Follow the golfer's handedness: a new round when it differs from the
+    /// device's hand, which finds the mat first, so the device is not ready
+    /// until it reports ready again. No handedness hint keeps the hand. The
+    /// mode and the club do not apply: the device only measures putts.
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), Error> {
         if let Some(handed) = hints.handedness {
             self.gate.want_hand(hand_of(Some(handed)));
             self.hold_to_log = true;
         }
+        Ok(())
     }
 
-    fn action(&mut self, action: Action) {
+    fn action(&mut self, action: &Action, _: &mut Events<'_>) -> Result<(), Error> {
         match action {
             Action::FindMat => {
                 self.gate.want_find();
                 self.hold_to_log = true;
             }
         }
+        Ok(())
     }
 
-    fn close(self, out: &mut Events<'_>) {
+    fn identity(&self) -> &DeviceIdentity {
+        &self.identity
+    }
+
+    fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
         if self.gate.pending() {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
@@ -825,37 +840,32 @@ impl<L: Link> Measuring<L> {
         if let Err(e) = self.link.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }
+        Ok(())
     }
 }
 
 impl FrpSession for ExPuttSession {
-    type Driver = ExPutt;
+    type Error = Error;
+    type Action = Action;
 
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.0.step(now, out)
     }
 
-    /// Follow the golfer's handedness: a new round when it differs from the
-    /// device's hand, which finds the mat first, so the device is not ready
-    /// until it reports ready again. No handedness hint keeps the hand. The
-    /// mode and the club do not apply: the device only measures putts.
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
-        self.0.hints(*hints);
-        Ok(())
+    fn hints(&mut self, hints: &TurnHints, out: &mut Events<'_>) -> Result<(), Error> {
+        self.0.hints(hints, out)
     }
 
-    fn action(&mut self, action: &Action) -> Result<(), Error> {
-        self.0.action(*action);
-        Ok(())
+    fn action(&mut self, action: &Action, out: &mut Events<'_>) -> Result<(), Error> {
+        self.0.action(action, out)
     }
 
     fn identity(&self) -> &DeviceIdentity {
-        &self.0.identity
+        self.0.identity()
     }
 
     fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
-        self.0.close(out);
-        Ok(())
+        self.0.close(out)
     }
 }
 
@@ -892,14 +902,6 @@ fn club_of(putt: &PuttResult) -> Option<ClubData> {
         face_angle: putt.face_deg,
         ..ClubData::default()
     })
-}
-
-/// The current UTC time in milliseconds since the Unix epoch.
-fn now_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +948,7 @@ impl RawTap {
             if this.wanted.load(Ordering::Relaxed) {
                 let _ = this.queue.send(Message {
                     dir,
-                    at: now_ms(),
+                    at: utc_ms(),
                     body: body.to_vec(),
                 });
             }

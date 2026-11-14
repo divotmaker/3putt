@@ -15,9 +15,6 @@ use crate::testing::{MockConfig, MockDevice, PUTT_RESULT_FULL};
 /// How long a smoke test gives the real device threads before it fails.
 const GIVE_UP: Duration = Duration::from_secs(8);
 
-/// How long each host poll runs.
-const POLL: Duration = Duration::from_millis(20);
-
 /// A UDP port nothing sends beacons to.
 fn free_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
@@ -51,8 +48,10 @@ fn localhost() -> Config {
     }
 }
 
-/// Poll `s` until an event `want` matches; everything seen, the match last.
-fn poll_until(
+/// Step `s` until an event `want` matches; everything seen, the match last.
+/// The host's clock stands still: these tests wait on the device's threads,
+/// never on the session's timers.
+fn step_until(
     host: &mut TestHost,
     s: &mut ExPuttSession,
     what: &str,
@@ -61,9 +60,11 @@ fn poll_until(
     let give_up = Instant::now() + GIVE_UP;
     let mut seen = Vec::new();
     loop {
-        let polled = host.with(|_, out| s.poll(POLL, out));
+        let activity = host.with(|now, out| s.step(now, out));
         seen.extend(host.take());
-        polled?;
+        if activity? == Activity::Idle {
+            std::thread::yield_now();
+        }
         if let Some(at) = seen.iter().position(&want) {
             seen.truncate(at + 1);
             return Ok(seen);
@@ -105,11 +106,11 @@ fn connects_over_tcp_measures_and_closes_the_session() {
     assert_eq!(s.identity().device, "ExPutt RG (127.0.0.1)");
 
     // The tap sees both directions (trace is the default level).
-    poll_until(&mut host, &mut s, "a heartbeat", traced("rx Test 7b")).expect("live");
-    poll_until(&mut host, &mut s, "a keepalive", traced("tx N_ALIVE 7b")).expect("live");
+    step_until(&mut host, &mut s, "a heartbeat", traced("rx Test 7b")).expect("live");
+    step_until(&mut host, &mut s, "a keepalive", traced("tx N_ALIVE 7b")).expect("live");
 
     mock.push_event(PUTT_RESULT_FULL);
-    let seen = poll_until(&mut host, &mut s, "a shot", |e| {
+    let seen = step_until(&mut host, &mut s, "a shot", |e| {
         matches!(e, DeviceEvent::Frp(FrpBody::ShotFinished(_)))
     })
     .expect("live");
@@ -135,7 +136,7 @@ fn a_device_that_closes_the_connection_ends_the_session() {
     let mut host = TestHost::new();
     let mut s = host.connect(&mut driver).expect("connect");
     mock.disconnect();
-    let error = poll_until(&mut host, &mut s, "the end", |_| false).unwrap_err();
+    let error = step_until(&mut host, &mut s, "the end", |_| false).unwrap_err();
     assert!(matches!(error, Error::Lost), "{error:?}");
 }
 

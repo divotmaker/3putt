@@ -4,8 +4,8 @@
 use std::sync::Mutex;
 
 use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
-use flightrelay::testing::TestHost;
-use flightrelay::{BusAlert, Club, ShotClub, ShotFinished, ShotLaunch, ShotTrigger};
+use flightrelay::testing::{TestHost, alerts, bodies, logs, raw_frames, statuses};
+use flightrelay::{Club, ShotClub, ShotFinished, ShotLaunch, ShotTrigger};
 
 use super::*;
 use crate::packet::Request;
@@ -149,16 +149,15 @@ fn live_for(host: &mut TestHost, s: &mut Measuring<ChanLink>, device: &Device, d
     settle(host, s);
 }
 
-/// `(ready, device_state)` of each status, in order.
+/// `(ready, device_state)` of each status the host holds, in order.
 fn states(events: &[DeviceEvent]) -> Vec<(bool, Option<String>)> {
-    events
+    statuses(events)
         .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Status(status) => Some((
-                status.blockers.is_empty(),
-                status.telemetry.get("device_state").cloned(),
-            )),
-            _ => None,
+        .map(|s| {
+            (
+                s.blockers.is_empty(),
+                s.telemetry.get("device_state").cloned(),
+            )
         })
         .collect()
 }
@@ -177,58 +176,32 @@ fn device_states(events: &[DeviceEvent]) -> Vec<String> {
 }
 
 fn ready(events: &[DeviceEvent]) -> Option<bool> {
-    states(events).last().map(|(ready, _)| *ready)
+    statuses(events).last().map(|s| s.blockers.is_empty())
 }
 
-fn frp(events: &[DeviceEvent]) -> Vec<FrpBody> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(body) => Some(body.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn alerts(events: &[DeviceEvent]) -> Vec<String> {
-    frp(events)
-        .into_iter()
-        .filter_map(|b| match b {
-            FrpBody::BusAlert(BusAlert { message, .. }) => Some(message),
-            _ => None,
-        })
-        .collect()
+fn alert_messages(events: &[DeviceEvent]) -> Vec<String> {
+    alerts(events).iter().map(|a| a.message.clone()).collect()
 }
 
 fn logged(events: &[DeviceEvent], level: Level, prefix: &str) -> bool {
-    events
+    logs(events)
         .iter()
-        .any(|e| matches!(e, DeviceEvent::Log(l, line) if *l == level && line.starts_with(prefix)))
+        .any(|(l, line)| *l == level && line.starts_with(prefix))
 }
 
 /// The shot events, trigger to finish.
 fn shot(events: &[DeviceEvent]) -> Vec<FrpBody> {
-    frp(events)
+    bodies(events)
         .into_iter()
-        .filter(|b| {
-            matches!(
-                b,
-                FrpBody::ShotTrigger(_)
-                    | FrpBody::ShotLaunch(_)
-                    | FrpBody::ShotClub(_)
-                    | FrpBody::ShotFinished(_)
-            )
-        })
+        .filter(|b| b.kind().starts_with("shot.") && b.kind() != "shot.raw")
+        .cloned()
         .collect()
 }
 
 fn raw_labels(events: &[DeviceEvent]) -> Vec<String> {
-    frp(events)
-        .into_iter()
-        .filter_map(|b| match b {
-            FrpBody::ShotRaw(f) => f.label,
-            _ => None,
-        })
+    raw_frames(events)
+        .iter()
+        .filter_map(|f| f.label.clone())
         .collect()
 }
 
@@ -265,7 +238,7 @@ fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
         "mat found 0.0s into session start"
     ));
 
-    host.with(|_, out| s.close(out));
+    host.with(|_, out| s.close(out)).expect("close");
     assert_eq!(ready(&host.take()), Some(false), "not ready after close");
     assert_eq!(device.sent(), [Sent::Close]);
 }
@@ -321,10 +294,10 @@ fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
     device.send(PUTT_READY);
     settle(&mut host, &mut s);
 
-    let before = now_ms().expect("clock");
+    let before = utc_ms().expect("clock");
     device.send(BALL_STRUCK);
     settle(&mut host, &mut s);
-    let after = now_ms().expect("clock");
+    let after = utc_ms().expect("clock");
     device.send(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let events = shot(&host.take());
@@ -394,7 +367,7 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
         .run_for(Duration::from_secs(1), |now, out| s.step(now, out))
         .unwrap_err();
     assert!(matches!(error, Error::Lost), "{error:?}");
-    host.with(|_, out| s.close(out));
+    host.with(|_, out| s.close(out)).expect("close");
     let seen = host.take();
     assert_eq!(shot(&seen).len(), 4, "the putt before the close went out");
     assert!(logged(&seen, Level::Info, "device closed the connection"));
@@ -415,7 +388,7 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
     });
     assert_eq!(delay, Duration::from_millis(50));
     assert_eq!(
-        alerts(&host.take()),
+        alert_messages(&host.take()),
         ["ExPutt error: connection to the device lost"]
     );
 
@@ -471,7 +444,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
         .unwrap_err();
     assert!(matches!(error, Error::Silent(d) if d == SILENCE.after_strike));
     assert_eq!(host.now() - struck, SILENCE.after_strike);
-    host.with(|_, out| s.close(out));
+    host.with(|_, out| s.close(out)).expect("close");
 
     // The next attempts wait at least the stall wait.
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
@@ -520,13 +493,23 @@ fn the_hand_follows_the_player_one_round_per_gap() {
 
     // Left, right, left again inside the gap: one round, to the left.
     host.advance(Duration::from_secs(4));
-    s.hints(TurnHints::default().with_handedness(Handedness::Right));
-    s.hints(
-        TurnHints::default()
-            .with_mode(Mode::Full)
-            .with_club(Club::Driver)
-            .with_handedness(Handedness::Left),
-    );
+    host.with(|_, out| {
+        s.hints(
+            &TurnHints::default().with_handedness(Handedness::Right),
+            out,
+        )
+    })
+    .expect("hints");
+    host.with(|_, out| {
+        s.hints(
+            &TurnHints::default()
+                .with_mode(Mode::Full)
+                .with_club(Club::Driver)
+                .with_handedness(Handedness::Left),
+            out,
+        )
+    })
+    .expect("hints");
     settle(&mut host, &mut s);
     let seen = host.take();
     assert!(logged(&seen, Level::Info, "mat search held for 6.0s"));
@@ -546,7 +529,8 @@ fn the_hand_follows_the_player_one_round_per_gap() {
     assert!(logged(&seen, Level::Info, "mat found after 2.0s"));
 
     // The same hand again asks for nothing.
-    s.hints(TurnHints::default().with_handedness(Handedness::Left));
+    host.with(|_, out| s.hints(&TurnHints::default().with_handedness(Handedness::Left), out))
+        .expect("hints");
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
     assert_eq!(device.sent(), []);
     assert_eq!(states(&host.take()), []);
@@ -564,10 +548,17 @@ fn a_hand_flipped_back_inside_the_gap_sends_nothing() {
     device.sent();
     host.take();
 
-    s.hints(TurnHints::default().with_handedness(Handedness::Left));
+    host.with(|_, out| s.hints(&TurnHints::default().with_handedness(Handedness::Left), out))
+        .expect("hints");
     settle(&mut host, &mut s);
     assert_eq!(ready(&host.take()), Some(false));
-    s.hints(TurnHints::default().with_handedness(Handedness::Right));
+    host.with(|_, out| {
+        s.hints(
+            &TurnHints::default().with_handedness(Handedness::Right),
+            out,
+        )
+    })
+    .expect("hints");
     settle(&mut host, &mut s);
     assert_eq!(ready(&host.take()), Some(true));
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
@@ -623,9 +614,12 @@ fn a_mode_or_club_alone_changes_nothing() {
     assert_eq!(device.sent(), [Sent::Start(Hand::Left)], "starts left");
     host.take();
 
-    s.hints(TurnHints::default().with_mode(Mode::Chipping));
-    s.hints(TurnHints::default().with_club(Club::PitchingWedge));
-    s.hints(TurnHints::default());
+    host.with(|_, out| s.hints(&TurnHints::default().with_mode(Mode::Chipping), out))
+        .expect("hints");
+    host.with(|_, out| s.hints(&TurnHints::default().with_club(Club::PitchingWedge), out))
+        .expect("hints");
+    host.with(|_, out| s.hints(&TurnHints::default(), out))
+        .expect("hints");
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
     assert_eq!(device.sent(), []);
     assert_eq!(states(&host.take()), []);
@@ -642,7 +636,8 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     host.take();
 
     // Past the gap: at once.
-    s.action(Action::FindMat);
+    host.with(|_, out| s.action(&Action::FindMat, out))
+        .expect("action");
     settle(&mut host, &mut s);
     assert_eq!(device.sent(), [Sent::FindMat]);
     device.send("FindMat,101");
@@ -658,8 +653,9 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     assert!(logged(&seen, Level::Warn, "mat search took 4.0s, over 3s"));
 
     // A request at shutdown is dropped.
-    s.action(Action::FindMat);
-    host.with(|_, out| s.close(out));
+    host.with(|_, out| s.action(&Action::FindMat, out))
+        .expect("action");
+    host.with(|_, out| s.close(out)).expect("close");
     assert!(logged(
         &host.take(),
         Level::Debug,
@@ -690,7 +686,7 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
                 now,
             )
         });
-        alerts(&host.take())
+        alert_messages(&host.take())
     };
     assert_eq!(
         attempt(&mut host, &timeout, None),
@@ -739,16 +735,16 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
 
     // The putt's own frame: as received, with the shot's key, before the
     // shot events built from it.
-    let bodies = frp(&seen);
-    let frame_at = bodies
+    let all = bodies(&seen);
+    let frame_at = all
         .iter()
         .position(|b| matches!(b, FrpBody::ShotRaw(f) if f.label.as_deref() == Some("PuttResult")))
         .expect("frame");
-    let FrpBody::ShotRaw(frame) = &bodies[frame_at] else {
+    let FrpBody::ShotRaw(frame) = all[frame_at] else {
         unreachable!()
     };
-    let FrpBody::ShotTrigger(trigger) = &bodies[frame_at + 1] else {
-        panic!("{bodies:#?}");
+    let FrpBody::ShotTrigger(trigger) = all[frame_at + 1] else {
+        panic!("{all:#?}");
     };
     assert_eq!(frame.key.as_ref(), Some(&trigger.key));
     assert_eq!(frame.dir, RawDir::Rx);
