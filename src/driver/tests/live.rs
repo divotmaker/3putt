@@ -3,7 +3,7 @@
 //! What the driver does with the device's events is tested in `stepped`.
 
 use std::net::{TcpListener, UdpSocket};
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::thread::JoinHandle;
 
 use flightrelay::driver::DeviceEvent;

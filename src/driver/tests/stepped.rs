@@ -2,6 +2,7 @@
 //! over a channel [`Link`] that the test plays the device on.
 
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
 
 use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
 use flightrelay::testing::{TestHost, alerts, bodies, logs, raw_frames, statuses};
