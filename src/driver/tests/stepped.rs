@@ -379,11 +379,7 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let delay = host.with(|now, out| {
         driver.retry_delay_at(
-            &SessionEnd {
-                error: Some(&error),
-                connected_for: Some(Duration::from_secs(1)),
-                attempts: 0,
-            },
+            &SessionEnd::new(Some(&error), Some(Duration::from_secs(1)), 0),
             &mut backoff,
             out,
             now,
@@ -453,11 +449,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let delay = host.with(|now, out| {
         driver.retry_delay_at(
-            &SessionEnd {
-                error: Some(&error),
-                connected_for: Some(Duration::from_secs(130)),
-                attempts: 0,
-            },
+            &SessionEnd::new(Some(&error), Some(Duration::from_secs(130)), 0),
             &mut backoff,
             out,
             now,
@@ -683,11 +675,7 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
     let mut attempt = |host: &mut TestHost, error: &Error, connected_for| {
         host.with(|now, out| {
             driver.retry_delay_at(
-                &SessionEnd {
-                    error: Some(error),
-                    connected_for,
-                    attempts: 1,
-                },
+                &SessionEnd::new(Some(error), connected_for, 1),
                 &mut backoff,
                 out,
                 now,

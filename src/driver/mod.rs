@@ -570,7 +570,7 @@ impl<L: Link> Measuring<L> {
                     key: Some(key.clone()),
                     ..RawFrame::new(dir, 0, message.body)
                 })),
-                None => out.wire(dir, label, message.body, message.at, !raw),
+                None => out.wire(dir, label, message.body, message.at, private),
             }
         }
     }

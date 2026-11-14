@@ -163,11 +163,7 @@ fn retry_after(
         }
     };
     let delay = driver.retry_delay(
-        &SessionEnd {
-            error,
-            connected_for,
-            attempts: 1,
-        },
+        &SessionEnd::new(error, connected_for, 1),
         backoff,
         &mut Events::new(&mut sink, &flags),
     );
