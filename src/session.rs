@@ -21,6 +21,7 @@ const CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 /// Options for [`Session::start`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionOptions {
     /// Putting hand, sent before measuring starts. Default right.
     pub hand: Hand,

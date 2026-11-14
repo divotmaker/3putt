@@ -13,12 +13,11 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const WAIT: Duration = Duration::from_secs(5);
 
 fn options(mock: &MockDevice) -> SessionOptions {
-    SessionOptions {
-        port: mock.port(),
-        keepalive_interval: Duration::from_millis(100),
-        mat_timeout: Duration::from_secs(5),
-        ..SessionOptions::default()
-    }
+    let mut options = SessionOptions::default();
+    options.port = mock.port();
+    options.keepalive_interval = Duration::from_millis(100);
+    options.mat_timeout = Duration::from_secs(5);
+    options
 }
 
 /// Receive events until `done` matches one, returning everything received.
@@ -54,10 +53,8 @@ fn json(requests: &[Request]) -> Vec<String> {
 #[test]
 fn full_session_flow() {
     let mock = MockDevice::spawn(MockConfig::default()).unwrap();
-    let opts = SessionOptions {
-        camera: true,
-        ..options(&mock)
-    };
+    let mut opts = options(&mock);
+    opts.camera = true;
     let session = Session::start(LOCALHOST, &opts).unwrap();
     assert!(session.is_connected());
 
@@ -137,10 +134,8 @@ fn full_session_flow() {
 #[test]
 fn without_camera_left_handed() {
     let mock = MockDevice::spawn(MockConfig::default()).unwrap();
-    let opts = SessionOptions {
-        hand: Hand::Left,
-        ..options(&mock)
-    };
+    let mut opts = options(&mock);
+    opts.hand = Hand::Left;
     let session = Session::start(LOCALHOST, &opts).unwrap();
     let setup = collect_until(&session, |e| *e == Event::PuttReady);
     assert!(!setup.iter().any(|e| matches!(e, Event::CameraFrame(_))));
@@ -192,15 +187,11 @@ fn stops_camera_stream_without_camera() {
 
 #[test]
 fn starts_measuring_when_mat_is_not_found() {
-    let mock = MockDevice::spawn(MockConfig {
-        find_mat: false,
-        ..MockConfig::default()
-    })
-    .unwrap();
-    let opts = SessionOptions {
-        mat_timeout: Duration::from_millis(200),
-        ..options(&mock)
-    };
+    let mut config = MockConfig::default();
+    config.find_mat = false;
+    let mock = MockDevice::spawn(config).unwrap();
+    let mut opts = options(&mock);
+    opts.mat_timeout = Duration::from_millis(200);
     let started = Instant::now();
     let session = Session::start(LOCALHOST, &opts).unwrap();
     assert!(started.elapsed() >= Duration::from_millis(200));
@@ -315,15 +306,11 @@ fn device_disconnect_ends_event_stream() {
 
 #[test]
 fn handshake_timeout() {
-    let mock = MockDevice::spawn(MockConfig {
-        answer_handshake: false,
-        ..MockConfig::default()
-    })
-    .unwrap();
-    let opts = SessionOptions {
-        reply_timeout: Duration::from_millis(300),
-        ..options(&mock)
-    };
+    let mut config = MockConfig::default();
+    config.answer_handshake = false;
+    let mock = MockDevice::spawn(config).unwrap();
+    let mut opts = options(&mock);
+    opts.reply_timeout = Duration::from_millis(300);
     match Session::start(LOCALHOST, &opts) {
         Err(err @ Error::Timeout(_)) => {
             let text = err.to_string();
@@ -341,11 +328,9 @@ fn connection_refused() {
         .local_addr()
         .unwrap()
         .port();
-    let opts = SessionOptions {
-        port,
-        connect_timeout: Duration::from_secs(1),
-        ..SessionOptions::default()
-    };
+    let mut opts = SessionOptions::default();
+    opts.port = port;
+    opts.connect_timeout = Duration::from_secs(1);
     assert!(matches!(
         Session::start(LOCALHOST, &opts),
         Err(Error::Io(_))
@@ -354,11 +339,9 @@ fn connection_refused() {
 
 #[test]
 fn low_level_connection() {
-    let mock = MockDevice::spawn(MockConfig {
-        heartbeat: None,
-        ..MockConfig::default()
-    })
-    .unwrap();
+    let mut config = MockConfig::default();
+    config.heartbeat = None;
+    let mock = MockDevice::spawn(config).unwrap();
     let addr = SocketAddr::new(LOCALHOST, mock.port());
     let mut conn = Connection::connect(addr, WAIT).unwrap();
     conn.handshake(WAIT).unwrap();
@@ -431,10 +414,8 @@ fn find_mat_resyncs_and_resumes_measuring() {
 #[test]
 fn find_mat_delivers_camera_frames_when_camera_is_on() {
     let mock = MockDevice::spawn(MockConfig::default()).unwrap();
-    let opts = SessionOptions {
-        camera: true,
-        ..options(&mock)
-    };
+    let mut opts = options(&mock);
+    opts.camera = true;
     let session = Session::start(LOCALHOST, &opts).unwrap();
     collect_until(&session, |e| *e == Event::PuttReady);
     session.find_mat().unwrap();
@@ -465,15 +446,11 @@ fn find_mat_keeps_the_current_hand() {
 /// after `mat_timeout`. A second call during the wait sends nothing.
 #[test]
 fn find_mat_does_not_wait_for_the_mat() {
-    let mock = MockDevice::spawn(MockConfig {
-        find_mat: false,
-        ..MockConfig::default()
-    })
-    .unwrap();
-    let opts = SessionOptions {
-        mat_timeout: Duration::from_millis(300),
-        ..options(&mock)
-    };
+    let mut config = MockConfig::default();
+    config.find_mat = false;
+    let mock = MockDevice::spawn(config).unwrap();
+    let mut opts = options(&mock);
+    opts.mat_timeout = Duration::from_millis(300);
     let session = Session::start(LOCALHOST, &opts).unwrap();
     assert!(mock.wait_until(WAIT, |p| {
         non_alive(p).ends_with(&json(&[Request::MatchBegin]))
@@ -506,10 +483,8 @@ fn find_mat_does_not_wait_for_the_mat() {
 #[test]
 fn close_during_find_mat_ends_the_wait() {
     let mock = MockDevice::spawn(MockConfig::default()).unwrap();
-    let opts = SessionOptions {
-        mat_timeout: Duration::from_secs(30),
-        ..options(&mock)
-    };
+    let mut opts = options(&mock);
+    opts.mat_timeout = Duration::from_secs(30);
     let session = Session::start(LOCALHOST, &opts).unwrap();
     collect_until(&session, |e| *e == Event::PuttReady);
     let before = non_alive(&mock.received()).len();

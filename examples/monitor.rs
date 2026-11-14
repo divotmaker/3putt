@@ -133,11 +133,9 @@ fn main() -> ExitCode {
         }
     }
 
-    let options = SessionOptions {
-        hand: args.hand,
-        camera: args.frames.is_some(),
-        ..SessionOptions::default()
-    };
+    let mut options = SessionOptions::default();
+    options.hand = args.hand;
+    options.camera = args.frames.is_some();
     println!("{} connecting to {ip}...", timestamp());
     let session = match Session::start(ip, &options) {
         Ok(s) => s,

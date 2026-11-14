@@ -80,6 +80,7 @@ pub fn fake_jpeg(len: usize) -> (Vec<u8>, String) {
 
 /// Behavior of a [`MockDevice`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MockConfig {
     /// Reply `N_OK` to `N_VERIFY_ID` and `N_REQ_CONNECT`. Default on.
     pub answer_handshake: bool,

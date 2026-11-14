@@ -75,6 +75,8 @@ mod zmtp;
 #[cfg(feature = "net")]
 pub use beacon::discover;
 pub use beacon::{Beacon, DEVICE_PORT, DISCOVERY_PORT};
+#[cfg(feature = "config")]
+pub use config::Config;
 pub use conn::{Connection, EventReader, PacketWriter};
 pub use error::{Error, Result};
 pub use event::{Event, NOT_MEASURED, PUTT_RESULT_FIELDS, PuttResult};

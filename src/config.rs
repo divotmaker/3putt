@@ -12,9 +12,11 @@
 //!
 //! // Blank (the default) finds the device on the network.
 //! assert_eq!(Config::default().ip(), Ok(None));
-//! let config = Config { address: Some("192.168.1.40".into()) };
+//! let mut config = Config::default();
+//! config.address = Some("192.168.1.40".into());
 //! assert!(config.validate().is_ok());
-//! let bad = Config { address: Some("exputt.local".into()) };
+//! config.address = Some("exputt.local".into());
+//! let bad = config;
 //! assert_eq!(bad.validate().unwrap_err().field.as_deref(), Some("address"));
 //! ```
 
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 /// Settings of the ExPutt driver.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct Config {
     /// The device's IP address. Unset or blank finds the device on the
     /// network by its discovery broadcast; anything else must be an IP
