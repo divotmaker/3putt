@@ -807,6 +807,7 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
         if let Err(e) = self.client.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }
+        self.drain_raw(out, None);
         (self.hang_up)(self.client.get_ref());
         Ok(())
     }

@@ -719,6 +719,13 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
     assert_eq!(frame.seq, 0, "the host numbers frames");
     assert!(frame.timestamp.is_some());
     assert_eq!(frame.data, device_event(PUTT_RESULT_FULL));
+
+    // The goodbye is raw frames too.
+    host.with(|_, out| s.close(out)).expect("close");
+    assert_eq!(
+        raw_labels(&host.take()),
+        ["PM_API_MatchEnded", "N_APP_PAUSE"]
+    );
 }
 
 /// How long until the client's first keepalive, from the handshake.
