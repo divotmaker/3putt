@@ -12,9 +12,11 @@
 //!
 //! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
 //! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
-//! or drives it itself through the `FrpDriver` contract: each
-//! `step(now)` handles at most one device message, and every timer below
-//! runs on the `now` the host steps the session with.
+//! or drives it itself through the `FrpDriver` contract. `connect` returns
+//! once the handshake is done; the session's mat search starts with its
+//! first step. Each `step(now)` handles at most one device message, and
+//! every timer below (the client's too) runs on the `now` the host steps
+//! the session with. Nothing runs between two steps: no threads.
 //!
 //! # Hints and actions
 //!
@@ -28,7 +30,8 @@
 //!   ([`Client::find_mat`]).
 //!
 //! Both run a mat search, and mat searches are spaced: none starts within
-//! 10 s of the previous one (the session's own at its start included). A
+//! 10 s of the previous one (the session's own, which starts as the
+//! handshake ends, included). A
 //! request inside that gap waits for its end; requests made meanwhile fold
 //! into the latest hand and one mat search. The `not_armed` blocker is
 //! reported while one waits.
@@ -58,8 +61,8 @@
 //! # Raw frames
 //!
 //! While the host's configuration turns raw frames on, every message the
-//! session sends and every known message it receives becomes a `shot.raw`: the JSON text as it
-//! crossed the socket, labeled with its name (`PuttResult`, `Test`,
+//! session sends and every known message it receives after the handshake
+//! becomes a `shot.raw`: the JSON text as it crossed the socket, labeled with its name (`PuttResult`, `Test`,
 //! `resyncToMat`, …). A putt result's frame carries the shot's key. Camera
 //! images and messages the crate does not recognize are never sent as raw
 //! frames; they reach only the host's trace log, as hex. While raw frames are
