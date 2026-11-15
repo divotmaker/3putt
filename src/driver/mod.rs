@@ -8,7 +8,8 @@
 //! vertical launch and no spin, so the launch carries neither. Its status is
 //! the `not_armed` blocker whenever the device is not ready for a putt (none
 //! when it is), and the `device_state` telemetry key (`finding mat`,
-//! `mat found`, `ready`, `ball struck`).
+//! `mat found`, `ready`, `ball struck`; `unknown` until the device names a
+//! state).
 //!
 //! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
 //! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
@@ -343,6 +344,7 @@ impl FrpDriver for ExPutt {
             .exclusive()
             .with_fixed_mode(Mode::Putting)
             .with_raw(RawProfile::new(RAW_TRANSPORT, 64, 64, 0, |_| false, true))
+            .with_telemetry(&[("device_state", "unknown")])
     }
 
     fn new(config: Config) -> Result<Self, ConfigError> {
@@ -478,8 +480,10 @@ impl<S> std::fmt::Debug for ExPuttSession<S> {
 impl<S: Read + Write> ExPuttSession<S> {
     /// Report the status: the `not_armed` blocker unless the device is ready
     /// (it is not while a requested mat search waits or past the silence
-    /// warning), and `device_state`. That is the whole status: the device
-    /// has no battery or attitude. The host publishes only what changed.
+    /// warning), and `device_state`, which reads as its declared
+    /// `"unknown"` until the device names a state. That is the whole
+    /// status: the device has no battery. The host publishes only what
+    /// changed.
     fn report(&self, out: &mut Events<'_>) {
         let ready = self.device_ready && !self.silent && !self.gate.pending();
         let mut status = if ready {

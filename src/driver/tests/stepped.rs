@@ -191,6 +191,13 @@ fn a_session_starts_not_ready_finds_the_mat_and_is_ready_once_the_device_says_so
         Level::Info,
         "mat found 0.0s into session start"
     ));
+    // Every state's actor carries the same, declared keys.
+    let info = ExPutt::info(&Config::default());
+    for status in statuses(&seen) {
+        let actor = info.bus_actor("x", Duration::from_secs(2), None, &status);
+        let keys: Vec<String> = actor.telemetry.expect("telemetry").into_keys().collect();
+        assert_eq!(keys, ["device_state"]);
+    }
 
     let before = mark(&device);
     host.with(|_, out| s.close(out));
