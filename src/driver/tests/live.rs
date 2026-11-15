@@ -171,6 +171,11 @@ fn a_discovered_device_is_connected_measures_and_is_closed() {
         DeviceEvent::Frp(FrpBody::ShotLaunch(m)) if m.launch.launch_speed.is_some()
     )));
 
+    // The device hangs up first, so the close's drain ends on the end of
+    // its stream, not on its bound.
+    if let Some(conn) = &pump.conn {
+        conn.shutdown(std::net::Shutdown::Write).expect("hang up");
+    }
     let mut sink = |_: DeviceEvent| {};
     s.close(&mut Events::new(&mut sink, &flags)).expect("close");
     while !pump.ended {
