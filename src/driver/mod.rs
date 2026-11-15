@@ -95,9 +95,6 @@ use crate::event::{Event, PuttResult};
 use crate::packet::{Hand, Request};
 use policy::{Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog};
 use raw::{Frame, PUTT_RESULT_LABEL, classify};
-#[cfg(feature = "testing")]
-pub use tuning::Tuning;
-#[cfg(not(feature = "testing"))]
 use tuning::Tuning;
 
 /// How long the TCP connect may take.
@@ -143,8 +140,7 @@ const NOT_ANSWERING_AFTER: Duration = Duration::from_secs(120);
 
 /// The alert raised once per outage of a device that accepts connections and
 /// never answers.
-pub const NOT_ANSWERING: &str =
-    "The ExPutt is not answering. If this lasts, turn it off and on again.";
+const NOT_ANSWERING: &str = "The ExPutt is not answering. If this lasts, turn it off and on again.";
 
 /// A mat search in a running session that takes longer than this is logged as
 /// a warning.
@@ -202,15 +198,14 @@ pub struct ExPutt {
     totals: Arc<Totals>,
 }
 
-#[cfg(feature = "testing")]
+#[cfg(test)]
 impl ExPutt {
-    /// A driver with test ports and session timings instead of the
-    /// device's ([`Tuning`]).
+    /// A driver that connects to `tuning`'s ports instead of the device's.
     ///
     /// # Errors
     ///
     /// The [`ConfigError`] of a config that is not usable.
-    pub fn with_tuning(config: Config, tuning: Tuning) -> Result<Self, ConfigError> {
+    pub(crate) fn with_tuning(config: Config, tuning: Tuning) -> Result<Self, ConfigError> {
         let mut driver = <Self as FrpDriver>::new(config)?;
         driver.tuning = tuning;
         Ok(driver)

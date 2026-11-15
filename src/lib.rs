@@ -78,4 +78,4 @@ pub use event::{Event, NOT_MEASURED, PUTT_RESULT_FIELDS, PuttResult};
 /// The flightrelay SDK this crate was built with, so callers name its types at the same version.
 #[cfg(feature = "config")]
 pub use flightrelay;
-pub use packet::{Hand, Request};
+pub use packet::Hand;

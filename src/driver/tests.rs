@@ -402,6 +402,5 @@ mod cli {
     }
 }
 
-#[cfg(feature = "testing")]
 mod live;
 mod stepped;

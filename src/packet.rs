@@ -26,8 +26,7 @@ pub enum Hand {
 
 /// A packet this client can send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Request {
+pub(crate) enum Request {
     /// `N_VERIFY_ID`: first packet of a session. The device answers `N_OK`.
     VerifyId,
     /// `N_REQ_CONNECT` (comment `FALSE`): join the session. The device answers

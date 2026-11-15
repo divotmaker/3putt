@@ -10,9 +10,9 @@
 //!  "_appVersion":"1.21.2176","_autoReconnectFlag":false,"_appLanguage":2}
 //! ```
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 #[cfg(feature = "driver")]
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
 use serde::Deserialize;
 #[cfg(feature = "driver")]
@@ -74,12 +74,6 @@ impl Beacon {
             auto_reconnect: wire.auto_reconnect,
             app_language: wire.app_language,
         })
-    }
-
-    /// The device's TCP protocol address (`ip:8889`).
-    #[must_use]
-    pub fn device_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.ip, DEVICE_PORT)
     }
 }
 
@@ -168,7 +162,6 @@ mod tests {
         assert_eq!(b.app_version.as_deref(), Some("1.21.2176"));
         assert_eq!(b.auto_reconnect, Some(false));
         assert_eq!(b.app_language, Some(2));
-        assert_eq!(b.device_addr(), "10.77.0.131:8889".parse().unwrap());
     }
 
     #[test]

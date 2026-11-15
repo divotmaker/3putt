@@ -1,8 +1,8 @@
 //! Packets received from the device.
 //!
 //! Device packets are JSON objects with `PacketID`, `RequestPacketID` and
-//! `Comment`. Replies to [`Request::VerifyId`](crate::Request::VerifyId) and
-//! [`Request::Connect`](crate::Request::Connect) use `PacketID` `N_OK`. Every
+//! `Comment`. Replies to `N_VERIFY_ID` and `N_REQ_CONNECT` use
+//! `PacketID` `N_OK`. Every
 //! other device event uses `PacketID` `N_FAIL` with a comma-separated
 //! `Comment` of the form `Name,args...`:
 //!

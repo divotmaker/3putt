@@ -222,7 +222,7 @@ impl<S: Read + Write> Client<S> {
     /// # Errors
     ///
     /// Socket errors.
-    pub fn send(&mut self, request: Request) -> Result<()> {
+    fn send(&mut self, request: Request) -> Result<()> {
         let body = request.to_json();
         self.outbox
             .extend_from_slice(&zmtp::encode_frame(body.as_bytes()));

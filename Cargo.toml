@@ -17,8 +17,7 @@ name = "threeputt"
 [features]
 default = []
 # Test support: `threeputt::testing` (an in-memory device speaking the
-# device side of the protocol, sample result strings), and the driver's
-# `Tuning`. Off by default.
+# device side of the protocol, sample result strings). Off by default.
 testing = []
 # `threeputt::config`: the driver's settings, with no network dependency
 # (builds for `wasm32-unknown-unknown`).
