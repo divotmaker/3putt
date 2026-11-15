@@ -312,7 +312,7 @@ impl ExPutt {
             identity = identity.with_firmware(firmware);
         }
         let now = ctx.now();
-        let mut session = ExPuttSession {
+        let session = ExPuttSession {
             client,
             hang_up,
             identity,
@@ -327,59 +327,8 @@ impl ExPutt {
             hold_to_log: false,
             totals: Arc::clone(&self.totals),
         };
-        // A handedness hint that arrived during the handshake is a request
-        // like any other.
-        if let Some(handed) = ctx.hints().handedness {
-            session.gate.want_hand(hand_of(Some(handed)));
-            session.hold_to_log = true;
-        }
         ctx.out.phase("measuring");
         Ok(session)
-    }
-
-    /// [`FrpDriver::retry_delay`] at `now`, which dates an attempt the
-    /// device did not answer.
-    fn retry_delay_at(
-        &mut self,
-        ended: &SessionEnd<'_, Error>,
-        backoff: &mut Backoff,
-        out: &mut Events<'_>,
-        now: Instant,
-    ) -> Duration {
-        let Some(error) = ended.error else {
-            return backoff.delay(ended.connected_for);
-        };
-        // A stop is no failure: no alert, and the reconnect policy stays.
-        if matches!(error, Error::Stopped) {
-            return backoff.delay(ended.connected_for);
-        }
-
-        // A device that accepts the connection and never answers is not
-        // hammered (see `Retry`); the user is told once, and the per-attempt
-        // alerts stop until a session succeeds.
-        let mut tell_not_answering = false;
-        if ended.connected_for.is_some() {
-            self.unanswered.recovered();
-        } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
-            tell_not_answering = self.unanswered.no_answer(now);
-        }
-        if !self.unanswered.told {
-            out.alert(Severity::Warn, format!("ExPutt error: {error}"));
-        }
-        if tell_not_answering {
-            out.log(
-                Level::Warn,
-                format!(
-                    "no answer from the device to {} s of connection attempts",
-                    self.unanswered.after.as_secs()
-                ),
-            );
-            out.alert(Severity::Warn, NOT_ANSWERING);
-        }
-
-        let silent = matches!(error, Error::Silent(_));
-        self.retry
-            .delay(backoff, ended.connected_for, silent, STALL_RECONNECT_WAIT)
     }
 }
 
@@ -445,14 +394,43 @@ impl FrpDriver for ExPutt {
     /// the first attempts after a session that was measuring and lengthened
     /// after a session lost to silence; an "ExPutt error" alert per attempt
     /// until the "not answering" alert has gone out, then none until a
-    /// session succeeds.
+    /// session succeeds. `ended.now` dates an attempt the device did not
+    /// answer.
     fn retry_delay(
         &mut self,
         ended: &SessionEnd<'_, Error>,
         backoff: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        Some(self.retry_delay_at(ended, backoff, out, Instant::now()))
+        let error = ended.error;
+        // A device that accepts the connection and never answers is not
+        // hammered (see `Retry`); the user is told once, and the per-attempt
+        // alerts stop until a session succeeds.
+        let mut tell_not_answering = false;
+        if ended.connected_for.is_some() {
+            self.unanswered.recovered();
+        } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
+            tell_not_answering = self.unanswered.no_answer(ended.now);
+        }
+        if !self.unanswered.told {
+            out.alert(Severity::Warn, format!("ExPutt error: {error}"));
+        }
+        if tell_not_answering {
+            out.log(
+                Level::Warn,
+                format!(
+                    "no answer from the device to {} s of connection attempts",
+                    self.unanswered.after.as_secs()
+                ),
+            );
+            out.alert(Severity::Warn, NOT_ANSWERING);
+        }
+
+        let silent = matches!(error, Error::Silent(_));
+        Some(
+            self.retry
+                .delay(backoff, ended.connected_for, silent, STALL_RECONNECT_WAIT),
+        )
     }
 }
 
@@ -573,10 +551,7 @@ impl<S: Read + Write> ExPuttSession<S> {
                 putt.raw,
             ),
         );
-        match self.struck_at.take() {
-            Some(at) => out.shot_trigger_at(key.clone(), at),
-            None => out.shot_trigger(key.clone()),
-        }
+        out.shot_trigger(key.clone(), self.struck_at.take());
         out.launch(key.clone(), launch_of(putt));
         if let Some(club) = club_of(putt) {
             out.club(key.clone(), club);
@@ -799,7 +774,7 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
     /// Say goodbye, then end the connection: on TCP, shut down the sending
     /// direction and read until the device closes its end, for at most half
     /// a second.
-    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
+    fn close(mut self, out: &mut Events<'_>) {
         if self.gate.pending() {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
@@ -809,7 +784,6 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
         }
         self.drain_raw(out, None);
         (self.hang_up)(self.client.get_ref());
-        Ok(())
     }
 }
 

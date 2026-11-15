@@ -1,7 +1,7 @@
 //! The driver on one thread, in virtual time: `TestHost` steps the session
 //! over `testing::FakeDevice` through `ExPutt::connect_with`.
 
-use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
+use flightrelay::driver::DeviceEvent;
 use flightrelay::testing::{TestHost, alerts, bodies, logs, raw_frames, statuses};
 use flightrelay::{Club, ShotClub, ShotFinished, ShotLaunch, ShotTrigger};
 
@@ -193,7 +193,7 @@ fn a_session_starts_not_ready_finds_the_mat_and_is_ready_once_the_device_says_so
     ));
 
     let before = mark(&device);
-    host.with(|_, out| s.close(out)).expect("close");
+    host.with(|_, out| s.close(out));
     assert_eq!(
         requests(&device, before),
         ["PM_API_MatchEnded", "N_APP_PAUSE"]
@@ -317,21 +317,20 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
         .run_for(Duration::from_secs(1), |now, out| s.step(now, out))
         .unwrap_err();
     assert!(matches!(error, Error::Lost), "{error:?}");
-    host.with(|_, out| s.close(out)).expect("close");
+    host.with(|_, out| s.close(out));
     let seen = host.take();
     assert_eq!(shot(&seen).len(), 4, "the putt before the close went out");
     assert!(logged(&seen, Level::Info, "device closed the connection"));
 
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let delay = host.with(|now, out| {
-        driver.retry_delay_at(
-            &SessionEnd::new(Some(&error), Some(Duration::from_secs(1)), 0),
+        driver.retry_delay(
+            &SessionEnd::new(&error, now, Some(Duration::from_secs(1)), 0),
             &mut backoff,
             out,
-            now,
         )
     });
-    assert_eq!(delay, Duration::from_millis(50));
+    assert_eq!(delay, Some(Duration::from_millis(50)));
     assert_eq!(
         alert_messages(&host.take()),
         ["ExPutt error: connection to the device lost"]
@@ -391,19 +390,18 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
         requests(&device, 0).len() < mark(&device),
         "keepalives went out"
     );
-    host.with(|_, out| s.close(out)).expect("close");
+    host.with(|_, out| s.close(out));
 
     // The next attempts wait at least the stall wait.
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let delay = host.with(|now, out| {
-        driver.retry_delay_at(
-            &SessionEnd::new(Some(&error), Some(Duration::from_secs(130)), 0),
+        driver.retry_delay(
+            &SessionEnd::new(&error, now, Some(Duration::from_secs(130)), 0),
             &mut backoff,
             out,
-            now,
         )
     });
-    assert_eq!(delay, STALL_RECONNECT_WAIT);
+    assert_eq!(delay, Some(STALL_RECONNECT_WAIT));
 
     // Without a strike, 90 s.
     host.take();
@@ -511,45 +509,6 @@ fn a_hand_flipped_back_inside_the_gap_sends_nothing() {
     assert_eq!(requests(&device, before), Vec::<String>::new());
 }
 
-#[test]
-fn a_hand_hinted_during_the_handshake_is_a_restart_to_it() {
-    /// A connect host whose hints turn left-handed after the first tick,
-    /// during the handshake.
-    struct TurnsLeft {
-        hints: TurnHints,
-        now: Instant,
-    }
-    impl ConnectHost for TurnsLeft {
-        fn tick(&mut self) {
-            self.hints = TurnHints::default().with_handedness(Handedness::Left);
-        }
-        fn hints(&self) -> &TurnHints {
-            &self.hints
-        }
-        fn now(&self) -> Instant {
-            self.now
-        }
-    }
-
-    let mut host = TestHost::new();
-    let mut connect = TurnsLeft {
-        hints: TurnHints::default(),
-        now: host.now(),
-    };
-    let mut driver = driver();
-    let device = FakeDevice::new();
-    let (stop, flags) = (Stop::new(), HostFlags::new());
-    let mut sink = |_: DeviceEvent| {};
-    let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut connect);
-    let mut s = driver.connect_with(&mut ctx, device.clone()).expect("open");
-    settle(&mut host, &mut s);
-    assert!(requests(&device, 0).contains(&"setDexterityRight".to_owned()));
-    let before = mark(&device);
-    host.advance(RESYNC_GAP);
-    settle(&mut host, &mut s);
-    assert_eq!(requests(&device, before), round("setDexterityLeft"));
-}
-
 /// A turn with no handedness keeps the device's hand.
 #[test]
 fn a_mode_or_club_alone_changes_nothing() {
@@ -608,7 +567,7 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     let before = mark(&device);
     host.with(|_, out| s.action(&Action::FindMat, out))
         .expect("action");
-    host.with(|_, out| s.close(out)).expect("close");
+    host.with(|_, out| s.close(out));
     assert!(logged(
         &host.take(),
         Level::Debug,
@@ -631,11 +590,10 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
     let refused = Error::Lost;
     let mut attempt = |host: &mut TestHost, error: &Error, connected_for| {
         host.with(|now, out| {
-            driver.retry_delay_at(
-                &SessionEnd::new(Some(error), connected_for, 1),
+            driver.retry_delay(
+                &SessionEnd::new(error, now, connected_for, 1),
                 &mut backoff,
                 out,
-                now,
             )
         });
         alert_messages(&host.take())
@@ -721,7 +679,7 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
     assert_eq!(frame.data, device_event(PUTT_RESULT_FULL));
 
     // The goodbye is raw frames too.
-    host.with(|_, out| s.close(out)).expect("close");
+    host.with(|_, out| s.close(out));
     assert_eq!(
         raw_labels(&host.take()),
         ["PM_API_MatchEnded", "N_APP_PAUSE"]

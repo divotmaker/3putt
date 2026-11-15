@@ -181,7 +181,7 @@ fn a_discovered_device_is_connected_measures_and_is_closed() {
         conn.shutdown(std::net::Shutdown::Write).expect("hang up");
     }
     let mut sink = |_: DeviceEvent| {};
-    s.close(&mut Events::new(&mut sink, &flags)).expect("close");
+    s.close(&mut Events::new(&mut sink, &flags));
     while !pump.ended {
         pump.pump();
     }
