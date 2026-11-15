@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 
 mod beacon;
+mod client;
 #[cfg(feature = "config")]
 pub mod config;
 mod conn;
@@ -68,13 +69,14 @@ mod error;
 mod event;
 mod packet;
 mod session;
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod zmtp;
 
 #[cfg(feature = "net")]
 pub use beacon::discover;
 pub use beacon::{Beacon, DEVICE_PORT, DISCOVERY_PORT};
+pub use client::Client;
 #[cfg(feature = "config")]
 pub use config::Config;
 pub use conn::{Connection, EventReader, PacketWriter};

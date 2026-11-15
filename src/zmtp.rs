@@ -110,8 +110,14 @@ impl<R: Read> FrameReader<R> {
         &self.inner
     }
 
+    /// The wrapped stream, for writing to it.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
     /// Read the peer's greeting: signature, revision, socket type, identity
-    /// frame.
+    /// frame. Nothing is consumed until the whole greeting has arrived, so
+    /// after a `WouldBlock` the call can be retried.
     ///
     /// # Errors
     ///
@@ -126,8 +132,9 @@ impl<R: Read> FrameReader<R> {
             return Err(Error::Greeting("unsupported revision"));
         }
         let socket_type = self.buf[11];
-        self.buf.drain(..12);
-        let (_, identity) = self.read_frame()?;
+        let (_, header, len) = self.frame_at(12)?;
+        let identity = self.buf[12 + header..12 + header + len].to_vec();
+        self.buf.drain(..12 + header + len);
         Ok(PeerGreeting {
             socket_type,
             identity,
@@ -156,14 +163,23 @@ impl<R: Read> FrameReader<R> {
 
     /// Read one frame, returning its flags and body.
     fn read_frame(&mut self) -> Result<(u8, Vec<u8>)> {
-        self.fill_to(2)?;
-        let flags = self.buf[0];
+        let (flags, header, len) = self.frame_at(0)?;
+        let body = self.buf[header..header + len].to_vec();
+        self.buf.drain(..header + len);
+        Ok((flags, body))
+    }
+
+    /// Buffer the whole frame that starts `at` bytes into the buffer, without
+    /// consuming anything; its flags, header length and body length.
+    fn frame_at(&mut self, at: usize) -> Result<(u8, usize, usize)> {
+        self.fill_to(at + 2)?;
+        let flags = self.buf[at];
         let (header, len) = if flags & FLAG_LONG == 0 {
-            (2, u64::from(self.buf[1]))
+            (2, u64::from(self.buf[at + 1]))
         } else {
-            self.fill_to(9)?;
+            self.fill_to(at + 9)?;
             let mut be = [0u8; 8];
-            be.copy_from_slice(&self.buf[1..9]);
+            be.copy_from_slice(&self.buf[at + 1..at + 9]);
             (9, u64::from_be_bytes(be))
         };
         if len > MAX_FRAME_LEN {
@@ -171,10 +187,8 @@ impl<R: Read> FrameReader<R> {
         }
         // Bounded by MAX_FRAME_LEN above, so this fits in usize.
         let len = usize::try_from(len).map_err(|_| Error::FrameTooLarge(len))?;
-        self.fill_to(header + len)?;
-        let body = self.buf[header..header + len].to_vec();
-        self.buf.drain(..header + len);
-        Ok((flags, body))
+        self.fill_to(at + header + len)?;
+        Ok((flags, header, len))
     }
 
     /// Read until at least `n` bytes are buffered.
@@ -357,6 +371,23 @@ mod tests {
             matches!(r.read_message(), Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
         );
         assert_eq!(r.read_message().unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn a_greeting_cut_short_in_its_identity_is_read_whole_later() {
+        let mut wire = Vec::from(SIGNATURE);
+        wire.extend_from_slice(&[0x01, 0x06, 0x00, 0x03, b'a', b'b', b'c']);
+        wire.extend_from_slice(&encode_frame(b"{}"));
+        let mut r = FrameReader::new(Stall {
+            first: wire[..14].to_vec(),
+            rest: wire[14..].to_vec(),
+            stalled: false,
+        });
+        assert!(
+            matches!(r.read_greeting(), Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(r.read_greeting().unwrap().identity, b"abc");
+        assert_eq!(r.read_message().unwrap(), b"{}");
     }
 
     #[test]
