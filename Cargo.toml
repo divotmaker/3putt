@@ -20,7 +20,7 @@ default = ["net"]
 # Without it the crate builds for targets with no sockets, such as
 # `wasm32-unknown-unknown`, for the `config` feature.
 net = ["dep:socket2"]
-# Test support: `threeputt::testing` (an in-process mock device speaking the
+# Test support: `threeputt::testing` (an in-memory device speaking the
 # device side of the protocol, sample result strings), and the driver's
 # `Tuning`. Off by default.
 testing = []

@@ -206,17 +206,6 @@ impl<R: Read> FrameReader<R> {
     }
 }
 
-/// Write one single-part frame.
-///
-/// # Errors
-///
-/// I/O errors from the stream.
-#[cfg(feature = "testing")]
-pub fn write_frame<W: io::Write>(out: &mut W, body: &[u8]) -> io::Result<()> {
-    out.write_all(&encode_frame(body))?;
-    out.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
