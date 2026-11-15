@@ -15,19 +15,16 @@ exclude = [".github/", "rust-toolchain.toml"]
 name = "threeputt"
 
 [features]
-default = ["net"]
-# The discovery socket the driver listens on, which needs `socket2`.
-# Without it the crate builds for targets with no sockets, such as
-# `wasm32-unknown-unknown`, for the `config` feature.
-net = ["dep:socket2"]
+default = []
 # Test support: `threeputt::testing` (an in-memory device speaking the
 # device side of the protocol, sample result strings), and the driver's
 # `Tuning`. Off by default.
 testing = []
-# `threeputt::config`: the driver's settings, with no network dependency.
+# `threeputt::config`: the driver's settings, with no network dependency
+# (builds for `wasm32-unknown-unknown`).
 config = ["dep:flightrelay", "flightrelay/config"]
 # `threeputt::driver`: the flightrelay `FrpDriver` for the ExPutt RG.
-driver = ["config", "net", "flightrelay/driver"]
+driver = ["config", "dep:socket2", "flightrelay/driver"]
 # The `threeputt-frp` binary: the driver served to FRP controllers.
 frp = ["driver", "flightrelay/server", "flightrelay/main"]
 

@@ -14,11 +14,11 @@
 //!
 //! # Features
 //!
-//! - **`net`** (default): the discovery socket the driver listens on, which
-//!   needs the `socket2` crate.
+//! No feature is on by default: the client, the packets and the beacon parser
+//! need none.
+//!
 //! - **`config`**: `config::Config`, the driver's settings, with no
-//!   network dependency (it builds for `wasm32-unknown-unknown` with
-//!   `--no-default-features`).
+//!   network dependency (it builds for `wasm32-unknown-unknown`).
 //! - **`driver`**: `driver::ExPutt`, a [flightrelay](https://docs.rs/flightrelay)
 //!   `FrpDriver` for the device: discovery, the session, putts as FRP
 //!   shots, and reconnects paced for a device that stalls.

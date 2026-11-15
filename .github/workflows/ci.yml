@@ -30,7 +30,7 @@ jobs:
       - name: Check each feature alone
         run: |
           cargo check --no-default-features
-          for f in net testing config driver frp; do
+          for f in testing config driver frp; do
             cargo check --no-default-features --features "$f"
           done
 
