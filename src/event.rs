@@ -77,8 +77,9 @@ fn is_frame_comment(comment: &str) -> bool {
 
 impl Event {
     /// Parse one message body from the device.
+    #[cfg(test)]
     #[must_use]
-    pub fn parse(body: &[u8]) -> Self {
+    pub(crate) fn parse(body: &[u8]) -> Self {
         match serde_json::from_slice::<Incoming>(body) {
             Ok(packet) => Self::from_incoming(packet),
             Err(_) => Self::not_json(body),
@@ -207,7 +208,7 @@ impl PuttResult {
     /// Returns `None` unless there are exactly 16 numbers and both ball
     /// fields (1 and 2) were measured.
     #[must_use]
-    pub fn parse(args: &str) -> Option<Self> {
+    pub(crate) fn parse(args: &str) -> Option<Self> {
         let mut raw = [0.0; PUTT_RESULT_FIELDS];
         let mut parts = args.split(',');
         for slot in &mut raw {
@@ -225,14 +226,6 @@ impl PuttResult {
             face_deg: measured(raw[5]),
             raw,
         })
-    }
-
-    /// Field `n` (1-based, as in the table above), or `None` if out of range
-    /// or not measured.
-    #[must_use]
-    pub fn field(&self, n: usize) -> Option<f64> {
-        let v = *self.raw.get(n.checked_sub(1)?)?;
-        (v != NOT_MEASURED).then_some(v)
     }
 }
 
@@ -364,9 +357,6 @@ mod tests {
         assert_eq!(p.face_deg, Some(1.481_460_935_257_73));
         assert!((p.raw[2] - 1531.8).abs() < 1e-9);
         assert!((p.raw[15] - 51.0).abs() < 1e-9);
-        assert_eq!(p.field(3), Some(1531.8));
-        assert_eq!(p.field(0), None);
-        assert_eq!(p.field(17), None);
     }
 
     #[test]
@@ -377,7 +367,6 @@ mod tests {
         assert_eq!(p.path_deg, None);
         assert_eq!(p.face_deg, None);
         assert_eq!(p.club_speed_mps_unconfirmed, None);
-        assert_eq!(p.field(3), None);
         assert!(p.raw[2..].iter().all(|&v| v == NOT_MEASURED));
     }
 
