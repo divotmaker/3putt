@@ -86,7 +86,7 @@ use flightrelay::{
 };
 
 use crate::beacon::{Beacon, Listener};
-pub use crate::config::Config;
+use crate::config::Config;
 use crate::conn::{Direction, Tap};
 use crate::event::{Event, PuttResult};
 use crate::packet::Hand;
