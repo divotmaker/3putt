@@ -16,7 +16,7 @@ name = "threeputt"
 
 [features]
 default = ["net"]
-# Device discovery (`discover`): the UDP beacon socket, which needs `socket2`.
+# The discovery socket the driver listens on, which needs `socket2`.
 # Without it the crate builds for targets with no sockets, such as
 # `wasm32-unknown-unknown`, for the `config` feature.
 net = ["dep:socket2"]
@@ -45,17 +45,9 @@ flightrelay = { version = "0.6.0", default-features = false, optional = true }
 # Ctrl-C handling in examples/monitor.rs.
 ctrlc = "3"
 
-[[test]]
-name = "session"
-required-features = ["testing"]
-
 [[bin]]
 name = "threeputt-frp"
 required-features = ["frp"]
-
-[[example]]
-name = "monitor"
-required-features = ["net"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

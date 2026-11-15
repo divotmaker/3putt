@@ -83,27 +83,7 @@ impl State {
 /// Every device message, from the handshake replies on, comes out of a poll
 /// as an [`Event`], including each [`PuttResult`](crate::PuttResult). Camera
 /// frames are dropped unread unless [`set_camera`](Self::set_camera) is on.
-///
-/// ```no_run
-/// use std::net::TcpStream;
-/// use threeputt::{Client, Event, Hand};
-///
-/// # fn main() -> threeputt::Result<()> {
-/// let stream = TcpStream::connect("192.168.1.40:8889")?;
-/// stream.set_nonblocking(true)?;
-/// let mut client = Client::new(stream, Hand::Right);
-/// loop {
-///     match client.poll()? {
-///         Some(Event::PuttResult(putt)) => println!(
-///             "{:.2} m/s, {:+.1} deg",
-///             putt.ball_speed_mps, putt.launch_direction_deg
-///         ),
-///         Some(_) => {}
-///         None => std::thread::sleep(std::time::Duration::from_millis(5)),
-///     }
-/// }
-/// # }
-/// ```
+/// The [crate docs](crate) have an example.
 pub struct Client<S> {
     frames: FrameReader<S>,
     /// Bytes not yet written: the stream would have blocked.
@@ -318,6 +298,23 @@ impl<S: Read + Write> Client<S> {
         self.frames.get_ref()
     }
 
+    /// Record every message body that crosses the stream from now on, or
+    /// stop recording.
+    #[cfg(feature = "driver")]
+    pub(crate) fn record(&mut self, on: bool) {
+        match (on, &self.wire) {
+            (true, None) => self.wire = Some(Vec::new()),
+            (false, Some(_)) => self.wire = None,
+            _ => {}
+        }
+    }
+
+    /// The bodies recorded since the last take, in order.
+    #[cfg(feature = "driver")]
+    pub(crate) fn take_wire(&mut self) -> Vec<(Direction, Vec<u8>)> {
+        self.wire.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
     fn see(&mut self, dir: Direction, body: &[u8]) {
         if let Some(wire) = &mut self.wire {
             wire.push((dir, body.to_vec()));
@@ -372,6 +369,39 @@ fn nothing_yet(e: Error) -> Result<Option<Event>> {
             Ok(None)
         }
         e => Err(e),
+    }
+}
+
+/// The longest [`hang_up`] reads while waiting for the device to close its
+/// end.
+#[cfg(feature = "driver")]
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
+
+/// The half-close after [`Client::close`] on TCP: shut down the sending
+/// direction, then read and drop what the device still sends until it
+/// closes its end, for at most [`CLOSE_WAIT`]. Data left unread when the
+/// socket closes would make it reset the connection rather than end it.
+#[cfg(feature = "driver")]
+pub(crate) fn hang_up(stream: &std::net::TcpStream) {
+    if stream.shutdown(std::net::Shutdown::Write).is_err() || stream.set_nonblocking(false).is_err()
+    {
+        return;
+    }
+    let give_up = Instant::now() + CLOSE_WAIT;
+    let mut buf = [0u8; 16 * 1024];
+    while let Some(left) = give_up
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+    {
+        if stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match (&*stream).read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 

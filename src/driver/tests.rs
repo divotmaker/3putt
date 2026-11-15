@@ -66,18 +66,6 @@ fn silence_is_allowed_90s_and_120s_after_a_strike() {
 }
 
 #[test]
-fn session_start_times_out_quickly() {
-    let o = Tuning::default().session_options(Hand::Left);
-    assert_eq!(o.connect_timeout, Duration::from_secs(3));
-    assert_eq!(o.reply_timeout, Duration::from_secs(3));
-    assert_eq!(o.mat_timeout, Duration::from_secs(5));
-    assert_eq!(o.hand, Hand::Left);
-    assert_eq!(o.port, crate::DEVICE_PORT);
-    assert!(!o.camera);
-    assert_eq!(ExPutt::STOP_WAIT, Duration::from_secs(18));
-}
-
-#[test]
 fn the_driver_is_a_measured_putting_mat_with_text_raw_frames() {
     let info = ExPutt::info(&Config::default());
     assert_eq!(info.kind, "exputt");

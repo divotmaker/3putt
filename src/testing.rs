@@ -3,8 +3,7 @@
 //!
 //! [`MockDevice`] listens on a local TCP port and speaks the device side of
 //! the protocol (ZMTP `ROUTER`, `N_OK` replies, `N_FAIL`-carried events), so
-//! [`Session`](crate::Session) and [`Connection`](crate::Connection) can be
-//! exercised without hardware. Like the device, it streams camera frames from
+//! a [`Client`](crate::Client) can be exercised without hardware. Like the device, it streams camera frames from
 //! `resyncToMat` until it receives `stopSendImage`.
 
 use std::io::{self, Read, Write};

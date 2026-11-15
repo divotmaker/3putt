@@ -1,64 +1,10 @@
-//! The raw-frame tap: the session's messages queued for the device thread,
-//! and which of them may leave the machine as raw frames.
+//! Which of the session's messages may leave the machine as raw frames.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-
-use flightrelay::utc_ms;
 use serde::Deserialize;
 
-use crate::conn::{Direction, Tap};
+use crate::client::Direction;
 use crate::event::Event;
 use crate::packet::{Hand, Request};
-
-/// One message the tap saw.
-#[derive(Debug)]
-pub(super) struct Message {
-    pub(super) dir: Direction,
-    /// When it crossed the socket (UTC ms).
-    pub(super) at: Option<u64>,
-    pub(super) body: Vec<u8>,
-}
-
-/// Queues the session's messages for the device thread while a host wants
-/// raw frames or trace lines.
-#[derive(Debug, Clone)]
-pub(super) struct RawTap {
-    wanted: Arc<AtomicBool>,
-    queue: Sender<Message>,
-}
-
-impl RawTap {
-    pub(super) fn new() -> (Self, Receiver<Message>) {
-        let (queue, rx) = mpsc::channel();
-        (
-            Self {
-                wanted: Arc::new(AtomicBool::new(false)),
-                queue,
-            },
-            rx,
-        )
-    }
-
-    pub(super) fn want(&self, wanted: bool) {
-        self.wanted.store(wanted, Ordering::Relaxed);
-    }
-
-    /// The tap the session calls on its reader and writer threads.
-    pub(super) fn tap(&self) -> Tap {
-        let this = self.clone();
-        Arc::new(move |dir, body: &[u8]| {
-            if this.wanted.load(Ordering::Relaxed) {
-                let _ = this.queue.send(Message {
-                    dir,
-                    at: utc_ms(),
-                    body: body.to_vec(),
-                });
-            }
-        })
-    }
-}
 
 /// The label of a putt result's frame.
 pub(super) const PUTT_RESULT_LABEL: &str = "PuttResult";

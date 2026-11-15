@@ -33,24 +33,10 @@ pub enum Error {
     /// A discovery datagram was not a valid beacon.
     #[error("invalid discovery broadcast from the device: {0}")]
     Beacon(String),
-
-    /// A worker thread panicked or a lock was poisoned.
-    #[error("internal state poisoned")]
-    Poisoned,
 }
 
 /// Crate result type.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Map a socket read timeout to [`Error::Timeout`], keeping other I/O errors.
-pub(crate) fn from_read_error(err: io::Error, waiting_for: &'static str) -> Error {
-    match err.kind() {
-        // Unix reports SO_RCVTIMEO expiry as WouldBlock, Windows as TimedOut.
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(waiting_for),
-        io::ErrorKind::UnexpectedEof => Error::Closed,
-        _ => Error::Io(err),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +52,6 @@ mod tests {
             Error::Greeting("bad signature"),
             Error::FrameTooLarge(1 << 20),
             Error::Beacon("no device address or id".into()),
-            Error::Poisoned,
         ];
         for err in errors {
             let text = err.to_string();

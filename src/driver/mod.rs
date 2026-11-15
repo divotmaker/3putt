@@ -1,7 +1,7 @@
 //! The flightrelay `FrpDriver` for the ExPutt RG (`driver` feature).
 //!
 //! [`ExPutt`] finds the device on the network (or uses
-//! [`Config::address`]), starts a [`Session`] with the player's hand, and
+//! [`Config::address`]), runs a [`Client`] session with the player's hand, and
 //! turns every putt into an FRP shot: `shot.trigger`, `shot.launch` (ball
 //! speed and launch direction), `shot.club` (putter path and face angle, when
 //! the putter was tracked) and `shot.finished`. The device measures no
@@ -20,12 +20,12 @@
 //!
 //! - The handedness of a `golfer.turn` (`TurnHints::handedness`), when it
 //!   differs from the hand the device has, starts a new round with that hand
-//!   ([`Session::restart_match`]). A turn with no handedness keeps the hand
+//!   ([`Client::restart_match`]). A turn with no handedness keeps the hand
 //!   the device has; a session starts right-handed when there is none. The
 //!   mode and the club do not apply: the device only measures putts
 //!   (`DriverInfo::fixed_mode` is putting).
 //! - [`Action::FindMat`] has the device locate the mat again
-//!   ([`Session::find_mat`]).
+//!   ([`Client::find_mat`]).
 //!
 //! Both run a mat search, and mat searches are spaced: none starts within
 //! 10 s of the previous one (the session's own at its start included). A
@@ -51,9 +51,9 @@
 //!   alert says the device is not answering, and the attempts go on quietly
 //!   until a session succeeds.
 //!
-//! Starting a session cannot be cut short, so [`ExPutt::STOP_WAIT`] covers
-//! its timeouts: 3 s each for the connect, the greeting and the two handshake
-//! replies, 5 s for the mat search, and a second to close.
+//! A stop ends a connect at once: discovery, the TCP connect and the
+//! handshake check for one on every pass. Closing says goodbye, then reads
+//! until the device closes its end, for at most half a second.
 //!
 //! # Raw frames
 //!
@@ -69,16 +69,16 @@ mod policy;
 mod raw;
 mod tuning;
 
-use std::net::IpAddr;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, DeviceIdentity, DeviceStatus, DriverInfo, Events, FrpDriver,
-    FrpSession, Level, RawProfile, SessionEnd, ShotIds, Stopped, TurnHints,
+    FrpSession, IDLE, Level, RawProfile, SessionEnd, ShotIds, Stopped, TurnHints,
 };
 use flightrelay::{
     ClubData, FrpBody, Handedness, Launch, Mode, RawDir, RawFrame, Severity, ShotKey, Source,
@@ -86,27 +86,19 @@ use flightrelay::{
 };
 
 use crate::beacon::{Beacon, Listener};
+use crate::client::{Client, Direction, hang_up};
 use crate::config::Config;
-use crate::conn::{Direction, Tap};
 use crate::event::{Event, PuttResult};
-use crate::packet::Hand;
-use crate::session::Session;
+use crate::packet::{Hand, Request};
 use policy::{Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog};
-use raw::{Frame, Message, PUTT_RESULT_LABEL, RawTap, classify};
+use raw::{Frame, PUTT_RESULT_LABEL, classify};
 #[cfg(feature = "testing")]
 pub use tuning::Tuning;
 #[cfg(not(feature = "testing"))]
 use tuning::Tuning;
 
-/// Session start timeouts. Starting a session cannot be interrupted, so these
-/// bound how long a stop or a reconnect can wait on a device that is away.
+/// How long the TCP connect may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
-const MAT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Longest single wait for the device to show up on the network, between
-/// ticks of the host.
-const DISCOVERY_SLICE: Duration = Duration::from_millis(250);
 
 /// How long discovery runs without finding the device before the user is
 /// told how to reach it another way.
@@ -134,14 +126,13 @@ const SILENCE: SilenceLimits = SilenceLimits {
 const STALL_RECONNECT_WAIT: Duration = Duration::from_secs(15);
 
 /// Shortest gap between two mat searches (the session's own, counted from the
-/// end of session start; a hand change; Find mat). A request inside the gap
+/// end of the handshake; a hand change; Find mat). A request inside the gap
 /// waits for its end; only the latest one is run.
 const RESYNC_GAP: Duration = Duration::from_secs(10);
 
 // A search that is still running when the gap ends would swallow the next
-// request: the session ignores a Find mat while the previous search waits for
-// its mat.
-const _: () = assert!(RESYNC_GAP.as_millis() > MAT_TIMEOUT.as_millis());
+// request: the client ignores a Find mat while a search waits for its mat.
+const _: () = assert!(RESYNC_GAP.as_millis() > crate::client::MAT_TIMEOUT.as_millis());
 
 /// How long connection attempts may fail to get an answer from a device that
 /// accepts the connection before the user is told.
@@ -161,14 +152,6 @@ const RAW_TRANSPORT: &str = "exputt-wifi";
 
 /// Product name: the model, and the start of the device label.
 const MODEL: &str = "ExPutt RG";
-
-/// The longest a stop waits for a connect. A session start in progress cannot
-/// be cut short: the TCP connect and the device's greeting (up to
-/// [`CONNECT_TIMEOUT`] each), two handshake replies ([`REPLY_TIMEOUT`] each)
-/// and the mat search ([`MAT_TIMEOUT`]), then a second to close the session.
-const STOP_WAIT: Duration = Duration::from_secs(
-    2 * CONNECT_TIMEOUT.as_secs() + 2 * REPLY_TIMEOUT.as_secs() + MAT_TIMEOUT.as_secs() + 1,
-);
 
 /// A device-specific operation of the ExPutt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,9 +215,31 @@ impl ExPutt {
 }
 
 impl ExPutt {
-    /// Wait for the device to announce itself on the network, on one socket,
-    /// ticking the host between waits. Raises one hint alert when the device
-    /// has not shown up after a while.
+    /// Run a whole session on `stream` instead of a TCP connection: the
+    /// handshake, then [`ExPuttSession`] as [`connect`](FrpDriver::connect)
+    /// returns it. `stream` must not block on reads (return `WouldBlock` when
+    /// it has nothing), e.g. `testing::FakeDevice`. Every timer runs on the
+    /// host's time ([`ConnectCtx::now`]), so a test host steps them. The
+    /// identity names the configured address, or `127.0.0.1` without one.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect`](FrpDriver::connect), without discovery and the TCP
+    /// connect.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn connect_with<S: Read + Write>(
+        &mut self,
+        ctx: &mut ConnectCtx<'_>,
+        stream: S,
+    ) -> Result<ExPuttSession<S>, Error> {
+        let ip = self.ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let started = connecting(ctx, ip);
+        self.open(ctx, stream, ip, None, started, |_| {})
+    }
+
+    /// Wait for the device to announce itself on the network, on one
+    /// non-blocking socket, ticking the host on every pass. Raises one hint
+    /// alert when the device has not shown up after a while.
     fn discover(&self, ctx: &mut ConnectCtx<'_>) -> Result<Beacon, Error> {
         ctx.out
             .log(Level::Info, "looking for the ExPutt on the network...");
@@ -243,21 +248,16 @@ impl ExPutt {
         let started = ctx.now();
         let mut hinted = false;
         loop {
-            ctx.tick()?;
-            match listener.recv(DISCOVERY_SLICE) {
-                Ok(beacon) => {
-                    ctx.out.log(
-                        Level::Info,
-                        format!(
-                            "found the ExPutt at {} (software {})",
-                            beacon.ip,
-                            beacon.app_version.as_deref().unwrap_or("unknown"),
-                        ),
-                    );
-                    return Ok(beacon);
-                }
-                Err(crate::Error::Timeout(_)) => {}
-                Err(e) => return Err(e.into()),
+            if let Some(beacon) = listener.try_recv()? {
+                ctx.out.log(
+                    Level::Info,
+                    format!(
+                        "found the ExPutt at {} (software {})",
+                        beacon.ip,
+                        beacon.app_version.as_deref().unwrap_or("unknown"),
+                    ),
+                );
+                return Ok(beacon);
             }
             let searched = ctx.now().saturating_duration_since(started);
             if !hinted && searched >= DISCOVERY_HINT_AFTER {
@@ -272,37 +272,41 @@ impl ExPutt {
                 // Warn is the lowest alert severity.
                 ctx.out.alert(Severity::Warn, DISCOVERY_HINT);
             }
+            ctx.wait(IDLE)?;
         }
     }
 
-    /// Start a measuring session with the device at `ip` over the link
-    /// `start` opens with the hand and the raw tap (the TCP [`Session`], or a
-    /// test's channel).
-    fn open<L: Link>(
+    /// Run the handshake on `stream`, ticking the host on every pass, and
+    /// build the session; its mat search starts with its first step.
+    /// `started` is when the connect began, `hang_up` ends the stream's
+    /// connection at close.
+    fn open<S: Read + Write>(
         &mut self,
         ctx: &mut ConnectCtx<'_>,
+        stream: S,
         ip: IpAddr,
         firmware: Option<String>,
-        start: impl FnOnce(&Tuning, Hand, Tap) -> crate::Result<L>,
-    ) -> Result<Measuring<L>, Error> {
-        ctx.out.phase("connecting");
+        started: Instant,
+        hang_up: fn(&S),
+    ) -> Result<ExPuttSession<S>, Error> {
         let hand = hand_of(ctx.hints().handedness);
-        ctx.out.log(
-            Level::Info,
-            format!("connecting to the ExPutt at {ip} ({hand:?} hand)..."),
-        );
-        ctx.tick()?;
-        let (raw, raw_rx) = RawTap::new();
-        raw.want(ctx.out.wants_raw() || ctx.out.enabled(Level::Trace));
-        // The session's own mat search runs inside `start`.
-        let resync_started = ctx.now();
-        let link = start(&self.tuning, hand, raw.tap())?;
+        let mut client = Client::new(stream, hand);
+        loop {
+            ctx.tick()?;
+            match client.poll_at(ctx.now())? {
+                Some(Event::Ack { request, .. }) if request == Request::Connect.packet_id() => {
+                    break;
+                }
+                Some(_) => {}
+                None => ctx.wait(IDLE)?,
+            }
+        }
+        client.record(ctx.out.wants_raw() || ctx.out.enabled(Level::Trace));
         self.totals.connects.fetch_add(1, Ordering::Relaxed);
         self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
 
         let name = format!("{MODEL} ({ip})");
-        ctx.out
-            .log(Level::Info, format!("connected to the {name}, measuring"));
+        ctx.out.log(Level::Info, format!("connected to the {name}"));
         let mut identity = DeviceIdentity::new(name.clone())
             .with_model(MODEL)
             .with_label(name);
@@ -310,25 +314,24 @@ impl ExPutt {
             identity = identity.with_firmware(firmware);
         }
         let now = ctx.now();
-        let mut session = Measuring {
-            link,
+        let mut session = ExPuttSession {
+            client,
+            hang_up,
             identity,
             ids: self.ids.clone(),
-            raw,
-            raw_rx,
             watchdog: Watchdog::new(SILENCE, now),
             gate: ResyncGate::new(RESYNC_GAP, hand, now),
             device_ready: false,
             device_state: None,
             silent: false,
-            mat_search: Some((resync_started, true)),
+            mat_search: Some((started, true)),
             struck_at: None,
             hold_to_log: false,
             totals: Arc::clone(&self.totals),
         };
-        // A handedness hint that arrived while the session started is a
-        // request like any other. After a stop, dropping the session closes
-        // it.
+        // A handedness hint that arrived during the handshake is a request
+        // like any other. After a stop, dropping the session drops the
+        // connection.
         ctx.tick()?;
         if let Some(handed) = ctx.hints().handedness {
             session.gate.want_hand(hand_of(Some(handed)));
@@ -388,9 +391,7 @@ impl FrpDriver for ExPutt {
     type Config = Config;
     type Error = Error;
     type Action = Action;
-    type Session = ExPuttSession;
-
-    const STOP_WAIT: Duration = STOP_WAIT;
+    type Session = ExPuttSession<TcpStream>;
 
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("exputt", MODEL, Source::Measured)
@@ -427,7 +428,7 @@ impl FrpDriver for ExPutt {
         }
     }
 
-    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ExPuttSession, Error> {
+    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ExPuttSession<TcpStream>, Error> {
         ctx.tick()?;
         let (ip, firmware) = if let Some(ip) = self.ip {
             (ip, None)
@@ -435,10 +436,13 @@ impl FrpDriver for ExPutt {
             let beacon = self.discover(ctx)?;
             (beacon.ip, beacon.app_version)
         };
-        self.open(ctx, ip, firmware, |tuning, hand, tap| {
-            Session::start_tapped(ip, &tuning.session_options(hand), tap)
-        })
-        .map(ExPuttSession)
+        let started = connecting(ctx, ip);
+        let stream = ctx
+            .connect_tcp(SocketAddr::new(ip, self.tuning.port), CONNECT_TIMEOUT)?
+            .map_err(crate::Error::Io)?;
+        let _ = stream.set_nodelay(true);
+        stream.set_nonblocking(true).map_err(crate::Error::Io)?;
+        self.open(ctx, stream, ip, firmware, started, hang_up)
     }
 
     /// The device's own reconnect policy: the host's backoff, shortened for
@@ -456,46 +460,14 @@ impl FrpDriver for ExPutt {
     }
 }
 
-/// A measuring session with the ExPutt. See the [module docs](self).
-#[derive(Debug)]
-pub struct ExPuttSession(Measuring<Session>);
-
-/// What the driver uses of a session with the device: its events, the mat
-/// searches, and the close. The TCP [`Session`]; a channel in tests.
-trait Link {
-    /// The device's events; disconnected once the device is gone.
-    fn events(&self) -> &Receiver<Event>;
-    fn find_mat(&self) -> crate::Result<()>;
-    fn restart_match(&self, hand: Hand) -> crate::Result<()>;
-    fn close(self) -> crate::Result<()>;
-}
-
-impl Link for Session {
-    fn events(&self) -> &Receiver<Event> {
-        Session::events(self)
-    }
-
-    fn find_mat(&self) -> crate::Result<()> {
-        Session::find_mat(self)
-    }
-
-    fn restart_match(&self, hand: Hand) -> crate::Result<()> {
-        Session::restart_match(self, hand)
-    }
-
-    fn close(self) -> crate::Result<()> {
-        Session::close(self)
-    }
-}
-
-/// The session behind [`ExPuttSession`], over any [`Link`].
-#[derive(Debug)]
-struct Measuring<L> {
-    link: L,
+/// A measuring session with the ExPutt over the stream `S` (TCP from
+/// [`connect`](FrpDriver::connect)). See the [module docs](self).
+pub struct ExPuttSession<S> {
+    client: Client<S>,
+    /// Ends the stream's connection at close.
+    hang_up: fn(&S),
     identity: DeviceIdentity,
     ids: ShotIds,
-    raw: RawTap,
-    raw_rx: Receiver<Message>,
     watchdog: Watchdog,
     gate: ResyncGate,
     /// The last `ready` the device itself reported; the status also depends
@@ -518,7 +490,18 @@ struct Measuring<L> {
     totals: Arc<Totals>,
 }
 
-impl<L: Link> Measuring<L> {
+impl<S> std::fmt::Debug for ExPuttSession<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExPuttSession")
+            .field("client", &self.client)
+            .field("identity", &self.identity)
+            .field("device_ready", &self.device_ready)
+            .field("device_state", &self.device_state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Read + Write> ExPuttSession<S> {
     /// Report the status: the `not_armed` blocker unless the device is ready
     /// (it is not while a requested mat search waits or past the silence
     /// warning), and `device_state`. That is the whole status: the device
@@ -549,28 +532,29 @@ impl<L: Link> Measuring<L> {
         }
     }
 
-    /// Emit the messages the tap queued: shareable ones as raw frames (a putt
-    /// result's with `putt`, its shot) while the host wants them, everything
-    /// else as audit lines (which reach only a trace log).
+    /// Emit the messages the client recorded: shareable ones as raw frames
+    /// (a putt result's with `putt`, its shot) while the host wants them,
+    /// everything else as audit lines (which reach only a trace log).
     fn drain_raw(&mut self, out: &mut Events<'_>, putt: Option<&ShotKey>) {
-        while let Ok(message) = self.raw_rx.try_recv() {
-            let dir = match message.dir {
-                Direction::Rx => RawDir::Rx,
-                Direction::Tx => RawDir::Tx,
-            };
-            let (label, private) = match classify(message.dir, &message.body) {
+        let at = utc_ms();
+        for (dir, body) in self.client.take_wire() {
+            let (label, private) = match classify(dir, &body) {
                 Frame::Shared(label) => (label, false),
                 Frame::Private(label) => (label, true),
+            };
+            let dir = match dir {
+                Direction::Rx => RawDir::Rx,
+                Direction::Tx => RawDir::Tx,
             };
             let raw = out.wants_raw() && !private;
             match putt.filter(|_| raw && label == PUTT_RESULT_LABEL) {
                 Some(key) => out.frp(FrpBody::ShotRaw(RawFrame {
-                    timestamp: message.at,
+                    timestamp: at,
                     label: Some(label.to_owned()),
                     key: Some(key.clone()),
-                    ..RawFrame::new(dir, 0, message.body)
+                    ..RawFrame::new(dir, 0, body)
                 })),
-                None => out.wire(dir, label, message.body, message.at, private),
+                None => out.wire(dir, label, body, at, private),
             }
         }
     }
@@ -730,14 +714,15 @@ impl<L: Link> Measuring<L> {
     }
 }
 
-impl<L: Link> FrpSession for Measuring<L> {
+impl<S: Read + Write> FrpSession for ExPuttSession<S> {
     type Error = Error;
     type Action = Action;
 
     /// One pass: a mat search that is due, then at most one device event
     /// (`Activity::Active`), or the watchdog when none is waiting (`Activity::Idle`).
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.raw.want(out.wants_raw() || out.enabled(Level::Trace));
+        self.client
+            .record(out.wants_raw() || out.enabled(Level::Trace));
         if std::mem::take(&mut self.hold_to_log) {
             self.log_hold(out, now);
         }
@@ -747,11 +732,11 @@ impl<L: Link> FrpSession for Measuring<L> {
             match search {
                 Resync::Restart(hand) => {
                     out.log(Level::Info, format!("hand -> {hand:?}, finding the mat"));
-                    self.link.restart_match(hand)?;
+                    self.client.restart_match(hand)?;
                 }
                 Resync::Find => {
                     out.log(Level::Info, "finding the mat");
-                    self.link.find_mat()?;
+                    self.client.find_mat()?;
                 }
             }
             self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
@@ -760,16 +745,21 @@ impl<L: Link> FrpSession for Measuring<L> {
             self.report(out);
         }
 
-        let event = match self.link.events().try_recv() {
-            Ok(event) => event,
-            Err(TryRecvError::Empty) => {
+        let event = match self.client.poll_at(now) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
                 self.drain_raw(out, None);
                 self.quiet(out, now)?;
                 return Ok(Activity::Idle);
             }
-            Err(TryRecvError::Disconnected) => {
+            Err(crate::Error::Closed) => {
                 self.drain_raw(out, None);
                 out.log(Level::Info, "device closed the connection");
+                return Err(Error::Lost);
+            }
+            Err(e) => {
+                self.drain_raw(out, None);
+                out.log(Level::Info, format!("connection to the device lost: {e}"));
                 return Err(Error::Lost);
             }
         };
@@ -810,41 +800,31 @@ impl<L: Link> FrpSession for Measuring<L> {
         &self.identity
     }
 
-    fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
+    /// Say goodbye, then end the connection: on TCP, shut down the sending
+    /// direction and read until the device closes its end, for at most half
+    /// a second.
+    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
         if self.gate.pending() {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
         out.log(Level::Info, "closing the session");
-        if let Err(e) = self.link.close() {
+        if let Err(e) = self.client.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }
+        (self.hang_up)(self.client.get_ref());
         Ok(())
     }
 }
 
-impl FrpSession for ExPuttSession {
-    type Error = Error;
-    type Action = Action;
-
-    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.0.step(now, out)
-    }
-
-    fn hints(&mut self, hints: &TurnHints, out: &mut Events<'_>) -> Result<(), Error> {
-        self.0.hints(hints, out)
-    }
-
-    fn action(&mut self, action: &Action, out: &mut Events<'_>) -> Result<(), Error> {
-        self.0.action(action, out)
-    }
-
-    fn identity(&self) -> &DeviceIdentity {
-        self.0.identity()
-    }
-
-    fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
-        self.0.close(out)
-    }
+/// Log the connect to `ip`; when it began.
+fn connecting(ctx: &mut ConnectCtx<'_>, ip: IpAddr) -> Instant {
+    ctx.out.phase("connecting");
+    let hand = hand_of(ctx.hints().handedness);
+    ctx.out.log(
+        Level::Info,
+        format!("connecting to the ExPutt at {ip} ({hand:?} hand)..."),
+    );
+    ctx.now()
 }
 
 /// The putting hand for the player's handedness (right when unknown).

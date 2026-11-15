@@ -1,147 +1,91 @@
 //! The driver on one thread, in virtual time: `TestHost` steps the session
-//! over a channel [`Link`] that the test plays the device on.
-
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Sender};
+//! over `testing::FakeDevice` through `ExPutt::connect_with`.
 
 use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
 use flightrelay::testing::{TestHost, alerts, bodies, logs, raw_frames, statuses};
 use flightrelay::{Club, ShotClub, ShotFinished, ShotLaunch, ShotTrigger};
 
 use super::*;
-use crate::packet::Request;
+use crate::testing::FakeDevice;
 
 const PUTT_READY: &str = "PuttReady,106";
 const BALL_STRUCK: &str = "PuttShot,107";
 const HEARTBEAT: &str = "Test,yy";
-const CAMERA_FRAME: &str = "/9j/4AAQSkZJRgABAQ==";
-
-const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-
-/// What the driver asked of the link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sent {
-    /// The session started with this hand.
-    Start(Hand),
-    FindMat,
-    Restart(Hand),
-    Close,
-}
-
-/// The driver's end of the channel.
-#[derive(Debug)]
-struct ChanLink {
-    events: Receiver<Event>,
-    sent: Arc<Mutex<Vec<Sent>>>,
-}
-
-impl Link for ChanLink {
-    fn events(&self) -> &Receiver<Event> {
-        &self.events
-    }
-
-    fn find_mat(&self) -> crate::Result<()> {
-        self.sent.lock().unwrap().push(Sent::FindMat);
-        Ok(())
-    }
-
-    fn restart_match(&self, hand: Hand) -> crate::Result<()> {
-        self.sent.lock().unwrap().push(Sent::Restart(hand));
-        Ok(())
-    }
-
-    fn close(self) -> crate::Result<()> {
-        self.sent.lock().unwrap().push(Sent::Close);
-        Ok(())
-    }
-}
-
-/// The test's end: the device. Like the TCP session, every message passes
-/// the raw tap before its event is delivered.
-struct Device {
-    events: Option<Sender<Event>>,
-    sent: Arc<Mutex<Vec<Sent>>>,
-    tap: Arc<Mutex<Option<Tap>>>,
-}
-
-impl Device {
-    /// The device sends the event `comment` (e.g. `PuttReady,106`).
-    fn send(&self, comment: &str) {
-        let body = device_event(comment);
-        self.tap(Direction::Rx, &body);
-        if let Some(events) = &self.events {
-            let _ = events.send(Event::parse(&body));
-        }
-    }
-
-    /// A message that passes the tap and delivers no event: a sent request,
-    /// or a camera frame the session drops.
-    fn tap(&self, dir: Direction, body: &[u8]) {
-        if let Some(tap) = &*self.tap.lock().unwrap() {
-            tap(dir, body);
-        }
-    }
-
-    /// The device closes the connection.
-    fn disconnect(&mut self) {
-        self.events = None;
-    }
-
-    /// What the driver asked of the link since the last call.
-    fn sent(&self) -> Vec<Sent> {
-        std::mem::take(&mut *self.sent.lock().unwrap())
-    }
-}
 
 /// A driver with the device's defaults.
 fn driver() -> ExPutt {
     ExPutt::new(Config::default()).expect("driver")
 }
 
-/// The device side and the link `driver.open` starts with.
-fn link_start() -> (
-    Device,
-    impl FnOnce(&Tuning, Hand, Tap) -> crate::Result<ChanLink>,
-) {
-    let (tx, events) = mpsc::channel();
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let tap = Arc::new(Mutex::new(None));
-    let device = Device {
-        events: Some(tx),
-        sent: Arc::clone(&sent),
-        tap: Arc::clone(&tap),
-    };
-    let start = move |_: &Tuning, hand: Hand, t: Tap| {
-        *tap.lock().unwrap() = Some(t);
-        sent.lock().unwrap().push(Sent::Start(hand));
-        Ok(ChanLink { events, sent })
-    };
-    (device, start)
-}
-
-/// A session on `host`, measuring.
-fn open(host: &mut TestHost, driver: &mut ExPutt) -> (Measuring<ChanLink>, Device) {
-    let (device, start) = link_start();
+/// A session on `host` over a fresh device, its handshake done.
+fn open(host: &mut TestHost, driver: &mut ExPutt) -> (ExPuttSession<FakeDevice>, FakeDevice) {
+    let device = FakeDevice::new();
     let session = host
-        .connect_with(|ctx| driver.open(ctx, LOCALHOST, None, start))
+        .connect_with(|ctx| driver.connect_with(ctx, device.clone()))
         .expect("open");
     (session, device)
 }
 
+/// A session on `host`, measuring: its mat search done, the device ready,
+/// the events taken.
+fn measuring(host: &mut TestHost, driver: &mut ExPutt) -> (ExPuttSession<FakeDevice>, FakeDevice) {
+    let (mut s, device) = open(host, driver);
+    settle(host, &mut s);
+    assert_eq!(ready(&host.take()), Some(true));
+    (s, device)
+}
+
+/// How many packets the client has sent so far.
+fn mark(device: &FakeDevice) -> usize {
+    device.received().len()
+}
+
+/// What the client sent from packet `from` on, keepalives left out: the
+/// `N_TEST` command or the packet type.
+fn requests(device: &FakeDevice, from: usize) -> Vec<String> {
+    device.received()[from..]
+        .iter()
+        .filter(|p| p.packet_id != "N_ALIVE")
+        .map(|p| match (&p.comment, p.packet_id.as_str()) {
+            (Some(c), "N_TEST") => c.clone(),
+            (_, id) => id.to_owned(),
+        })
+        .collect()
+}
+
+/// The requests of a new round with `hand`'s command.
+fn round(hand: &str) -> Vec<String> {
+    [
+        "PM_API_MatchEnded",
+        "sendImage",
+        "resyncToMat",
+        "stopSendImage",
+        hand,
+        "PM_API_MatchBegin",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 /// Step at the current instant until nothing is waiting.
-fn settle(host: &mut TestHost, s: &mut Measuring<ChanLink>) {
+fn settle(host: &mut TestHost, s: &mut ExPuttSession<FakeDevice>) {
     while host.with(|now, out| s.step(now, out)).expect("step") == Activity::Active {}
 }
 
 /// `d` of time, with the device's heartbeat once a second, up to and
 /// including a step at its end.
-fn live_for(host: &mut TestHost, s: &mut Measuring<ChanLink>, device: &Device, d: Duration) {
+fn live_for(
+    host: &mut TestHost,
+    s: &mut ExPuttSession<FakeDevice>,
+    device: &FakeDevice,
+    d: Duration,
+) {
     let end = host.now() + d;
     while let Some(left) = end
         .checked_duration_since(host.now())
         .filter(|d| !d.is_zero())
     {
-        device.send(HEARTBEAT);
+        device.push_event(HEARTBEAT);
         host.run_for(left.min(Duration::from_secs(1)), |now, out| {
             s.step(now, out)
         })
@@ -207,7 +151,7 @@ fn raw_labels(events: &[DeviceEvent]) -> Vec<String> {
 }
 
 #[test]
-fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
+fn a_session_starts_not_ready_finds_the_mat_and_is_ready_once_the_device_says_so() {
     let mut host = TestHost::new();
     let mut driver = driver();
     let (mut s, device) = open(&mut host, &mut driver);
@@ -220,22 +164,27 @@ fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
         })
         .collect();
     assert_eq!(phases, ["connecting", "measuring"]);
-    assert_eq!(device.sent(), [Sent::Start(Hand::Right)], "no hint: right");
+    assert_eq!(requests(&device, 0), ["N_VERIFY_ID", "N_REQ_CONNECT"]);
     assert_eq!(s.identity.device, "ExPutt RG (127.0.0.1)");
     assert_eq!(s.identity.model.as_deref(), Some("ExPutt RG"));
     assert_eq!(s.identity.firmware, None);
 
+    // The first step starts the mat search; the device answers at once.
     settle(&mut host, &mut s);
     assert_eq!(
-        states(&host.take()),
-        [],
-        "the host starts a session not armed"
+        requests(&device, 2),
+        [
+            "sendImage",
+            "resyncToMat",
+            "stopSendImage",
+            "setDexterityRight",
+            "PM_API_MatchBegin"
+        ],
+        "no hint: right"
     );
-    device.send("MatOK,102");
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
     let seen = host.take();
-    assert_eq!(device_states(&seen), ["mat found", "ready"]);
+    assert_eq!(states(&seen)[0], (false, Some("finding mat".to_owned())));
+    assert_eq!(device_states(&seen), ["finding mat", "mat found", "ready"]);
     assert_eq!(ready(&seen), Some(true));
     assert!(logged(
         &seen,
@@ -243,19 +192,21 @@ fn a_session_starts_not_ready_and_is_ready_once_the_device_says_so() {
         "mat found 0.0s into session start"
     ));
 
+    let before = mark(&device);
     host.with(|_, out| s.close(out)).expect("close");
-    assert_eq!(device.sent(), [Sent::Close]);
+    assert_eq!(
+        requests(&device, before),
+        ["PM_API_MatchEnded", "N_APP_PAUSE"]
+    );
 }
 
 #[test]
 fn putts_are_putter_shots_numbered_in_order() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    settle(&mut host, &mut s);
-    host.take();
+    let (mut s, device) = measuring(&mut host, &mut driver);
 
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let events = shot(&host.take());
     let [
@@ -274,7 +225,7 @@ fn putts_are_putter_shots_numbered_in_order() {
     assert_eq!(Some(club.clone()), club_of(&putt(PUTT_RESULT_FULL)));
 
     // An untracked putter: ball data only.
-    device.send(PUTT_RESULT_BALL_ONLY);
+    device.push_event(PUTT_RESULT_BALL_ONLY);
     settle(&mut host, &mut s);
     let events = shot(&host.take());
     assert!(
@@ -294,15 +245,13 @@ fn putts_are_putter_shots_numbered_in_order() {
 fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
+    let (mut s, device) = measuring(&mut host, &mut driver);
 
     let before = utc_ms().expect("clock");
-    device.send(BALL_STRUCK);
+    device.push_event(BALL_STRUCK);
     settle(&mut host, &mut s);
     let after = utc_ms().expect("clock");
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let events = shot(&host.take());
     let FrpBody::ShotTrigger(ShotTrigger {
@@ -315,7 +264,7 @@ fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
     assert!((before..=after).contains(at), "{before} <= {at} <= {after}");
 
     for comment in [PUTT_READY, BALL_STRUCK, PUTT_READY, PUTT_RESULT_FULL] {
-        device.send(comment);
+        device.push_event(comment);
     }
     settle(&mut host, &mut s);
     let events = shot(&host.take());
@@ -335,13 +284,10 @@ fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
 fn readiness_follows_the_putt_cycle() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
-    assert_eq!(ready(&host.take()), Some(true));
+    let (mut s, device) = measuring(&mut host, &mut driver);
 
     // Struck: not ready until the device says so again.
-    device.send(BALL_STRUCK);
+    device.push_event(BALL_STRUCK);
     settle(&mut host, &mut s);
     assert_eq!(
         states(&host.take()),
@@ -349,11 +295,11 @@ fn readiness_follows_the_putt_cycle() {
     );
 
     // The result changes neither value.
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     assert_eq!(states(&host.take()), []);
 
-    device.send(PUTT_READY);
+    device.push_event(PUTT_READY);
     settle(&mut host, &mut s);
     assert_eq!(states(&host.take()), [(true, Some("ready".to_owned()))]);
 }
@@ -364,8 +310,8 @@ fn readiness_follows_the_putt_cycle() {
 fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, mut device) = open(&mut host, &mut driver);
-    device.send(PUTT_RESULT_FULL);
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    device.push_event(PUTT_RESULT_FULL);
     device.disconnect();
     let error = host
         .run_for(Duration::from_secs(1), |now, out| s.step(now, out))
@@ -391,8 +337,8 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
         ["ExPutt error: connection to the device lost"]
     );
 
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_RESULT_FULL);
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let FrpBody::ShotTrigger(trigger) = &shot(&host.take())[0] else {
         unreachable!()
@@ -401,15 +347,13 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
 }
 
 /// Silence: not ready from 10 s until the device sends again, lost at 90 s
-/// (120 s after a strike), and the next attempt waits the stall wait.
+/// (120 s after a strike), and the next attempt waits the stall wait. The
+/// client's keepalives go on meanwhile; they are no data from the device.
 #[test]
 fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
-    host.take();
+    let (mut s, device) = measuring(&mut host, &mut driver);
 
     host.run_for(SILENCE.warn_after, |now, out| s.step(now, out))
         .expect("within the limit");
@@ -424,7 +368,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
         "no data from the device for 10.0s"
     ));
 
-    device.send(HEARTBEAT);
+    device.push_event(HEARTBEAT);
     settle(&mut host, &mut s);
     let seen = host.take();
     assert_eq!(ready(&seen), Some(true));
@@ -435,7 +379,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
     ));
 
     // After a strike the limit is 120 s.
-    device.send(BALL_STRUCK);
+    device.push_event(BALL_STRUCK);
     settle(&mut host, &mut s);
     let struck = host.now();
     let error = host
@@ -443,6 +387,10 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
         .unwrap_err();
     assert!(matches!(error, Error::Silent(d) if d == SILENCE.after_strike));
     assert_eq!(host.now() - struck, SILENCE.after_strike);
+    assert!(
+        requests(&device, 0).len() < mark(&device),
+        "keepalives went out"
+    );
     host.with(|_, out| s.close(out)).expect("close");
 
     // The next attempts wait at least the stall wait.
@@ -459,7 +407,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
 
     // Without a strike, 90 s.
     host.take();
-    let (mut s, _device) = open(&mut host, &mut driver);
+    let (mut s, _device) = measuring(&mut host, &mut driver);
     let opened = host.now();
     let error = host
         .run_for(Duration::from_secs(200), |now, out| s.step(now, out))
@@ -480,13 +428,10 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
 fn the_hand_follows_the_player_one_round_per_gap() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
-    assert_eq!(device.sent(), [Sent::Start(Hand::Right)]);
-    host.take();
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    let before = mark(&device);
 
-    // Left, right, left again inside the gap: one round, to the left.
+    // Right, then left inside the gap: one round, to the left.
     host.advance(Duration::from_secs(4));
     host.with(|_, out| {
         s.hints(
@@ -505,19 +450,23 @@ fn the_hand_follows_the_player_one_round_per_gap() {
         )
     })
     .expect("hints");
+    device.set_find_mat(false);
     settle(&mut host, &mut s);
     let seen = host.take();
     assert!(logged(&seen, Level::Info, "mat search held for 6.0s"));
     assert_eq!(ready(&seen), Some(false), "not ready while one waits");
-    assert_eq!(device.sent(), []);
+    assert_eq!(requests(&device, before), Vec::<String>::new());
 
     live_for(&mut host, &mut s, &device, Duration::from_secs(6));
-    assert_eq!(device.sent(), [Sent::Restart(Hand::Left)]);
-    for comment in ["FindMat,101", "MatOK,102", PUTT_READY] {
-        device.send(comment);
-    }
+    assert_eq!(
+        requests(&device, before),
+        round("setDexterityLeft")[..3].to_vec()
+    );
+    device.push_event("FindMat,101");
     host.advance(Duration::from_secs(2));
+    device.push_event("MatOK,102");
     settle(&mut host, &mut s);
+    assert_eq!(requests(&device, before), round("setDexterityLeft"));
     let seen = host.take();
     // The restart reports not ready with the state the device last sent.
     assert_eq!(
@@ -528,10 +477,11 @@ fn the_hand_follows_the_player_one_round_per_gap() {
     assert!(logged(&seen, Level::Info, "mat found after 2.0s"));
 
     // The same hand again asks for nothing.
+    let before = mark(&device);
     host.with(|_, out| s.hints(&TurnHints::default().with_handedness(Handedness::Left), out))
         .expect("hints");
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
-    assert_eq!(device.sent(), []);
+    assert_eq!(requests(&device, before), Vec::<String>::new());
     assert!(states(&host.take()).iter().all(|(ready, _)| *ready));
 }
 
@@ -541,11 +491,8 @@ fn the_hand_follows_the_player_one_round_per_gap() {
 fn a_hand_flipped_back_inside_the_gap_sends_nothing() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
-    device.sent();
-    host.take();
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    let before = mark(&device);
 
     host.with(|_, out| s.hints(&TurnHints::default().with_handedness(Handedness::Left), out))
         .expect("hints");
@@ -561,13 +508,13 @@ fn a_hand_flipped_back_inside_the_gap_sends_nothing() {
     settle(&mut host, &mut s);
     assert_eq!(ready(&host.take()), Some(true));
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
-    assert_eq!(device.sent(), []);
+    assert_eq!(requests(&device, before), Vec::<String>::new());
 }
 
 #[test]
-fn a_hand_hinted_while_the_session_starts_is_a_restart_to_it() {
+fn a_hand_hinted_during_the_handshake_is_a_restart_to_it() {
     /// A connect host whose hints turn left-handed after the first tick,
-    /// while the session starts.
+    /// during the handshake.
     struct TurnsLeft {
         hints: TurnHints,
         now: Instant,
@@ -590,15 +537,17 @@ fn a_hand_hinted_while_the_session_starts_is_a_restart_to_it() {
         now: host.now(),
     };
     let mut driver = driver();
-    let (device, start) = link_start();
+    let device = FakeDevice::new();
     let (stop, flags) = (Stop::new(), HostFlags::new());
     let mut sink = |_: DeviceEvent| {};
     let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut connect);
-    let mut s = driver.open(&mut ctx, LOCALHOST, None, start).expect("open");
-    assert_eq!(device.sent(), [Sent::Start(Hand::Right)]);
+    let mut s = driver.connect_with(&mut ctx, device.clone()).expect("open");
+    settle(&mut host, &mut s);
+    assert!(requests(&device, 0).contains(&"setDexterityRight".to_owned()));
+    let before = mark(&device);
     host.advance(RESYNC_GAP);
     settle(&mut host, &mut s);
-    assert_eq!(device.sent(), [Sent::Restart(Hand::Left)]);
+    assert_eq!(requests(&device, before), round("setDexterityLeft"));
 }
 
 /// A turn with no handedness keeps the device's hand.
@@ -607,11 +556,12 @@ fn a_mode_or_club_alone_changes_nothing() {
     let mut host =
         TestHost::new().with_hints(TurnHints::default().with_handedness(Handedness::Left));
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
-    settle(&mut host, &mut s);
-    assert_eq!(device.sent(), [Sent::Start(Hand::Left)], "starts left");
-    host.take();
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    assert!(
+        requests(&device, 0).contains(&"setDexterityLeft".to_owned()),
+        "starts left"
+    );
+    let before = mark(&device);
 
     host.with(|_, out| s.hints(&TurnHints::default().with_mode(Mode::Chipping), out))
         .expect("hints");
@@ -620,7 +570,7 @@ fn a_mode_or_club_alone_changes_nothing() {
     host.with(|_, out| s.hints(&TurnHints::default(), out))
         .expect("hints");
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
-    assert_eq!(device.sent(), []);
+    assert_eq!(requests(&device, before), Vec::<String>::new());
     assert_eq!(states(&host.take()), []);
 }
 
@@ -628,22 +578,25 @@ fn a_mode_or_club_alone_changes_nothing() {
 fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(PUTT_READY);
+    let (mut s, device) = measuring(&mut host, &mut driver);
     live_for(&mut host, &mut s, &device, RESYNC_GAP);
-    device.sent();
     host.take();
+    let before = mark(&device);
 
     // Past the gap: at once.
+    device.set_find_mat(false);
     host.with(|_, out| s.action(&Action::FindMat, out))
         .expect("action");
     settle(&mut host, &mut s);
-    assert_eq!(device.sent(), [Sent::FindMat]);
-    device.send("FindMat,101");
+    assert_eq!(
+        requests(&device, before),
+        round("setDexterityRight")[..3].to_vec()
+    );
+    device.push_event("FindMat,101");
     live_for(&mut host, &mut s, &device, Duration::from_secs(4));
-    device.send("MatOK,102");
-    device.send(PUTT_READY);
+    device.push_event("MatOK,102");
     settle(&mut host, &mut s);
+    assert_eq!(requests(&device, before), round("setDexterityRight"));
     let seen = host.take();
     assert_eq!(
         device_states(&seen),
@@ -652,6 +605,7 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     assert!(logged(&seen, Level::Warn, "mat search took 4.0s, over 3s"));
 
     // A request at shutdown is dropped.
+    let before = mark(&device);
     host.with(|_, out| s.action(&Action::FindMat, out))
         .expect("action");
     host.with(|_, out| s.close(out)).expect("close");
@@ -660,7 +614,10 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
         Level::Debug,
         "mat search request dropped"
     ));
-    assert_eq!(device.sent(), [Sent::Close]);
+    assert_eq!(
+        requests(&device, before),
+        ["PM_API_MatchEnded", "N_APP_PAUSE"]
+    );
 }
 
 /// Each failed attempt alerts, until two minutes of unanswered attempts:
@@ -709,24 +666,40 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
     assert_eq!(attempt(&mut host, &timeout, None), [NOT_ANSWERING]);
 }
 
+/// The session's own mat search, as raw frame labels: what the client
+/// sends and what the device answers, its camera frame left out.
+const MAT_SEARCH: [&str; 9] = [
+    "sendImage",
+    "resyncToMat",
+    "FindMat",
+    "MatOK",
+    "stopSendImage",
+    "setDexterityRight",
+    "PM_API_MatchBegin",
+    "IndiCatorOut",
+    "PuttReady",
+];
+
 #[test]
 fn putts_and_messages_are_raw_frames_while_wanted() {
     let mut host = TestHost::new();
     host.flags.set_wants_raw(true);
     let mut driver = driver();
     let (mut s, device) = open(&mut host, &mut driver);
-    device.tap(Direction::Tx, Request::Alive.to_json().as_bytes());
-    device.send(HEARTBEAT);
-    device.tap(Direction::Rx, &device_event(CAMERA_FRAME));
-    settle(&mut host, &mut s);
-    device.send(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let seen = host.take();
-    assert_eq!(raw_labels(&seen), ["N_ALIVE", "Test", "PuttResult"]);
+    assert_eq!(raw_labels(&seen), MAT_SEARCH, "nothing of the handshake");
     assert!(
         logged(&seen, Level::Trace, "rx camera frame 7b"),
         "camera frames reach only the trace log"
     );
+    device.push_event(HEARTBEAT);
+    host.run_for(KEEPALIVE_AFTER, |now, out| s.step(now, out))
+        .expect("step");
+    device.push_event(PUTT_RESULT_FULL);
+    settle(&mut host, &mut s);
+    let seen = host.take();
+    assert_eq!(raw_labels(&seen), ["Test", "N_ALIVE", "PuttResult"]);
 
     // The putt's own frame: as received, with the shot's key, before the
     // shot events built from it.
@@ -748,27 +721,30 @@ fn putts_and_messages_are_raw_frames_while_wanted() {
     assert_eq!(frame.data, device_event(PUTT_RESULT_FULL));
 }
 
+/// How long until the client's first keepalive, from the handshake.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(2);
+
 #[test]
 fn raw_frames_start_and_stop_with_the_hosts_wish() {
     let mut host = TestHost::new();
     host.flags.set_min_level(Level::Info);
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.send(HEARTBEAT);
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    device.push_event(HEARTBEAT);
     settle(&mut host, &mut s);
     assert_eq!(raw_labels(&host.take()), Vec::<String>::new());
 
     // A controller asks for raw frames: the messages from the next step on.
     host.flags.set_wants_raw(true);
     settle(&mut host, &mut s);
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     assert_eq!(raw_labels(&host.take()), ["PuttResult"]);
 
     // The last one leaves: frames stop, the session goes on.
     host.flags.set_wants_raw(false);
     settle(&mut host, &mut s);
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let seen = host.take();
     assert_eq!(raw_labels(&seen), Vec::<String>::new());
@@ -780,11 +756,11 @@ fn trace_alone_logs_every_message_as_hex() {
     // Trace on (the default level), no raw frames wanted.
     let mut host = TestHost::new();
     let mut driver = driver();
-    let (mut s, device) = open(&mut host, &mut driver);
-    device.tap(Direction::Tx, Request::Alive.to_json().as_bytes());
-    device.send(HEARTBEAT);
-    settle(&mut host, &mut s);
-    device.send(PUTT_RESULT_FULL);
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    device.push_event(HEARTBEAT);
+    host.run_for(KEEPALIVE_AFTER, |now, out| s.step(now, out))
+        .expect("step");
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let seen = host.take();
     assert_eq!(raw_labels(&seen), Vec::<String>::new());
@@ -799,10 +775,10 @@ fn no_raw_frames_or_audit_lines_unless_wanted() {
     host.flags.set_min_level(Level::Info);
     let mut driver = driver();
     let (mut s, device) = open(&mut host, &mut driver);
-    device.tap(Direction::Tx, Request::Alive.to_json().as_bytes());
-    device.send(HEARTBEAT);
-    settle(&mut host, &mut s);
-    device.send(PUTT_RESULT_FULL);
+    device.push_event(HEARTBEAT);
+    host.run_for(KEEPALIVE_AFTER, |now, out| s.step(now, out))
+        .expect("step");
+    device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     let seen = host.take();
     assert_eq!(shot(&seen).len(), 4);

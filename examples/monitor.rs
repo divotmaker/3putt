@@ -8,16 +8,20 @@
 //! be in mobile mode). `--frames DIR` streams the camera while the device
 //! locates the mat and saves each frame as a JPEG. Ctrl-C ends the session
 //! cleanly.
+//!
+//! A plain loop: poll the client, sleep a little when nothing came.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use threeputt::{Event, Hand, PuttResult, Session, SessionOptions, discover};
+use threeputt::{Beacon, Client, DEVICE_PORT, DISCOVERY_PORT, Event, Hand, PuttResult};
+
+/// The pause between two polls that brought nothing.
+const IDLE: Duration = Duration::from_millis(5);
 
 const MPS_TO_MPH: f64 = 2.236_936;
 
@@ -87,6 +91,38 @@ fn describe_putt(p: &PuttResult) -> String {
     )
 }
 
+/// Wait up to `timeout` for the device's beacon on UDP port 9999.
+fn discover(timeout: Duration) -> std::io::Result<Beacon> {
+    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))?;
+    let give_up = Instant::now() + timeout;
+    let mut buf = [0u8; 2048];
+    loop {
+        let left = give_up.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        socket.set_read_timeout(Some(left))?;
+        let (n, from) = socket.recv_from(&mut buf)?;
+        if let Ok(beacon) = Beacon::parse(&buf[..n], from.ip()) {
+            return Ok(beacon);
+        }
+    }
+}
+
+/// Say goodbye, then end the connection: shut down the sending direction
+/// and read until the device closes its end (at most half a second), so it
+/// ends rather than resets.
+fn close(mut client: Client<TcpStream>) {
+    if let Err(e) = client.close() {
+        eprintln!("monitor: close: {e}");
+    }
+    let stream = client.get_ref();
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = std::io::copy(&mut &*stream, &mut std::io::sink());
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -133,28 +169,31 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut options = SessionOptions::default();
-    options.hand = args.hand;
-    options.camera = args.frames.is_some();
     println!("{} connecting to {ip}...", timestamp());
-    let session = match Session::start(ip, &options) {
+    let addr = SocketAddr::new(ip, DEVICE_PORT);
+    let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .and_then(|s| s.set_nonblocking(true).map(|()| s))
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("monitor: could not connect to {ip}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    println!("{} measuring (Ctrl-C to stop)", timestamp());
+    let mut client = Client::new(stream, args.hand);
+    client.set_camera(args.frames.is_some());
 
     let mut frame_no = 0u32;
-    let mut lost = false;
     while running.load(Ordering::SeqCst) {
-        let event = match session.events().recv_timeout(Duration::from_millis(200)) {
-            Ok(e) => e,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                lost = true;
-                break;
+        let event = match client.poll() {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                std::thread::sleep(IDLE);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("{} monitor: session ended: {e}", timestamp());
+                return ExitCode::FAILURE;
             }
         };
         let ts = timestamp();
@@ -182,14 +221,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if lost {
-        eprintln!("{} monitor: connection to the device lost", timestamp());
-        let _ = session.close();
-        return ExitCode::FAILURE;
-    }
     println!("{} closing session", timestamp());
-    if let Err(e) = session.close() {
-        eprintln!("monitor: close: {e}");
-    }
+    close(client);
     ExitCode::SUCCESS
 }
