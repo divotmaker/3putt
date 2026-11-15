@@ -1,19 +1,8 @@
 use super::*;
 use crate::packet::Request;
+use crate::testing::{PUTT_RESULT_FULL, PUTT_RESULT_PULLED, device_event};
 
-const PUTT_RESULT_FULL: &str = "PuttResult,1.43502296839333,2.50345148852703,1531.8,1.50199074589741,0.55270159796981,1.48146093525773,105,101,101,201,400,599,2.15371070126487,1.48146093525773,1.3619127672204,51";
-const PUTT_RESULT_PULLED: &str = "PuttResult,-10.2790290384019,3.789423622279,965.7,2.04021538616595,-5.16989038221816,-10.5479310729379,90,105,123,166,365,563,-12.8369117616901,-10.5479310729379,-13.4288407664039,51";
 const PUTT_RESULT_BALL_ONLY: &str = "PuttResult,0.561243876918884,1.80518847921913,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999,-9999";
-
-fn device_event(comment: &str) -> Vec<u8> {
-    serde_json::json!({
-        "PacketID": "N_FAIL",
-        "RequestPacketID": "N_REQ_CONNECT",
-        "Comment": comment,
-    })
-    .to_string()
-    .into_bytes()
-}
 
 /// The putt the device reports for `comment`, as parsed.
 fn putt(comment: &str) -> PuttResult {

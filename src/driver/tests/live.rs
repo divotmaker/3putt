@@ -89,7 +89,8 @@ impl Pump {
                     break;
                 }
                 Ok(n) => self.device.write_all(&buf[..n]).expect("device write"),
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("the driver's connection failed: {e}"),
             }
         }
         while let Ok(n) = self.device.read(&mut buf) {
@@ -171,8 +172,11 @@ fn a_discovered_device_is_connected_measures_and_is_closed() {
         DeviceEvent::Frp(FrpBody::ShotLaunch(m)) if m.launch.launch_speed.is_some()
     )));
 
-    // The device hangs up first, so the close's drain ends on the end of
-    // its stream, not on its bound.
+    // A heartbeat is left unread at the close: a close that drops the
+    // connection resets it, which the pump fails on, where a half-close
+    // reads on to the device's hang-up.
+    device.push_event("Test,yy");
+    pump.pump();
     if let Some(conn) = &pump.conn {
         conn.shutdown(std::net::Shutdown::Write).expect("hang up");
     }

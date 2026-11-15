@@ -333,9 +333,7 @@ impl ExPutt {
             totals: Arc::clone(&self.totals),
         };
         // A handedness hint that arrived during the handshake is a request
-        // like any other. After a stop, dropping the session drops the
-        // connection.
-        ctx.tick()?;
+        // like any other.
         if let Some(handed) = ctx.hints().handedness {
             session.gate.want_hand(hand_of(Some(handed)));
             session.hold_to_log = true;
