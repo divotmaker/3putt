@@ -37,13 +37,13 @@ fn measuring(host: &mut TestHost, driver: &mut ExPutt) -> (ExPuttSession<FakeDev
 
 /// How many packets the client has sent so far.
 fn mark(device: &FakeDevice) -> usize {
-    device.received().len()
+    device.sent().len()
 }
 
 /// What the client sent from packet `from` on, keepalives left out: the
 /// `N_TEST` command or the packet type.
 fn requests(device: &FakeDevice, from: usize) -> Vec<String> {
-    device.received()[from..]
+    device.sent()[from..]
         .iter()
         .filter(|p| p.packet_id != "N_ALIVE")
         .map(|p| match (&p.comment, p.packet_id.as_str()) {

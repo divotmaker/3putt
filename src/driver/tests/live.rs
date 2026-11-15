@@ -185,7 +185,7 @@ fn a_discovered_device_is_connected_measures_and_is_closed() {
     while !pump.ended {
         pump.pump();
     }
-    let sent: Vec<String> = device.received().iter().map(|p| p.json.clone()).collect();
+    let sent: Vec<String> = device.sent().iter().map(|p| p.json.clone()).collect();
     assert_eq!(
         sent[sent.len() - 2..],
         [Request::MatchEnded.to_json(), Request::AppPause.to_json()]

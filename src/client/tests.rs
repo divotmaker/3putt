@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::testing::{FakeDevice, PUTT_RESULT_FULL};
 
-/// The `(PacketID or N_TEST command)` of each packet the device received.
+/// The `(PacketID or N_TEST command)` of each packet the client sent to the device.
 fn sent(device: &FakeDevice) -> Vec<String> {
     device
-        .received()
+        .sent()
         .iter()
         .map(|p| match (&p.comment, p.packet_id.as_str()) {
             (Some(c), "N_TEST") => c.clone(),
@@ -95,7 +95,7 @@ fn a_session_greets_joins_finds_the_mat_measures_and_keeps_alive() {
     assert!(matches!(drain(&mut client, t0)[..], [Event::PuttResult(_)]));
 
     // A keepalive every 2 s from the end of the handshake, nothing else.
-    let before = device.received().len();
+    let before = device.sent().len();
     for s in [1, 2, 3, 4, 5, 6] {
         drain(&mut client, t0 + Duration::from_millis(s * 1000 - 1));
         drain(&mut client, t0 + Duration::from_secs(s));
@@ -222,7 +222,7 @@ fn find_mat_and_restart_match_run_a_round_and_fold_into_one_under_way() {
 fn close_says_goodbye_and_stops_the_camera_during_a_search() {
     let t0 = Instant::now();
     let (mut client, device) = measuring(Hand::Right, t0);
-    let before = device.received().len();
+    let before = device.sent().len();
     client.close().expect("close");
     assert_eq!(
         sent(&device)[before..],
@@ -230,12 +230,12 @@ fn close_says_goodbye_and_stops_the_camera_during_a_search() {
     );
     // No keepalives after the goodbye.
     drain(&mut client, t0 + Duration::from_secs(10));
-    assert_eq!(device.received().len(), before + 2);
+    assert_eq!(device.sent().len(), before + 2);
 
     let (mut client, device) = measuring(Hand::Right, t0);
     device.set_find_mat(false);
     client.find_mat().expect("find mat");
-    let before = device.received().len();
+    let before = device.sent().len();
     client.close().expect("close");
     assert_eq!(
         sent(&device)[before..],
@@ -289,11 +289,11 @@ fn a_write_that_would_block_goes_out_whole_at_later_polls() {
         blocked: false,
     };
     let mut client = Client::new(stream, Hand::Right);
-    while device.received().len() < 7 {
+    while device.sent().len() < 7 {
         client.poll_at(t0).expect("poll");
     }
     assert_eq!(sent(&device)[6], "PM_API_MatchBegin");
-    let exact: Vec<String> = device.received().iter().map(|p| p.json.clone()).collect();
+    let exact: Vec<String> = device.sent().iter().map(|p| p.json.clone()).collect();
     assert_eq!(exact[0], Request::VerifyId.to_json());
     assert_eq!(exact[5], Request::SetHand(Hand::Right).to_json());
 }

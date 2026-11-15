@@ -56,15 +56,15 @@ pub(crate) fn fake_jpeg(len: usize) -> (Vec<u8>, String) {
     (jpeg, text)
 }
 
-/// A packet the [`FakeDevice`] received from the client.
+/// A packet the client sent to the [`FakeDevice`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ReceivedPacket {
+pub struct SentPacket {
     /// `PacketID`.
     pub packet_id: String,
     /// `Comment`.
     pub comment: Option<String>,
-    /// The body exactly as received.
+    /// The body exactly as sent.
     pub json: String,
 }
 
@@ -113,7 +113,7 @@ struct Fake {
     greeted: bool,
     /// Wire bytes waiting to be read by the client.
     outbox: std::collections::VecDeque<u8>,
-    received: Vec<ReceivedPacket>,
+    sent: Vec<SentPacket>,
     answer_handshake: bool,
     find_mat: bool,
     disconnected: bool,
@@ -133,7 +133,7 @@ impl FakeDevice {
             inbox: FrameReader::new(std::collections::VecDeque::new()),
             greeted: false,
             outbox: zmtp::greeting(zmtp::SOCKET_ROUTER).into(),
-            received: Vec::new(),
+            sent: Vec::new(),
             answer_handshake: true,
             find_mat: true,
             disconnected: false,
@@ -169,8 +169,8 @@ impl FakeDevice {
 
     /// Every packet the client has sent, in order.
     #[must_use]
-    pub fn received(&self) -> Vec<ReceivedPacket> {
-        self.state().received.clone()
+    pub fn sent(&self) -> Vec<SentPacket> {
+        self.state().sent.clone()
     }
 
     fn state(&self) -> MutexGuard<'_, Fake> {
@@ -222,14 +222,14 @@ impl Fake {
                 }
                 _ => {}
             }
-            self.received.push(packet);
+            self.sent.push(packet);
         }
     }
 }
 
-fn parse_packet(body: &[u8]) -> ReceivedPacket {
+fn parse_packet(body: &[u8]) -> SentPacket {
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-    ReceivedPacket {
+    SentPacket {
         packet_id: value["PacketID"].as_str().unwrap_or_default().to_owned(),
         comment: value["Comment"].as_str().map(str::to_owned),
         json: String::from_utf8_lossy(body).into_owned(),
