@@ -13,7 +13,7 @@ fn putt(comment: &str) -> PuttResult {
 }
 
 #[test]
-fn silence_is_allowed_90s_and_120s_after_a_strike() {
+fn silence_is_allowed_90s_and_120s_while_a_ball_is_detected() {
     let t0 = Instant::now();
     let at = |s: u64| t0 + Duration::from_secs(s);
     let mut w = Watchdog::new(SILENCE, t0);
@@ -32,15 +32,15 @@ fn silence_is_allowed_90s_and_120s_after_a_strike() {
     assert_eq!(w.event(&Event::Heartbeat, at(86)), None);
     assert_eq!(w.check(at(96)), Quiet::Warn(Duration::from_secs(10)));
 
-    // After a strike, 120 s until the result or ready.
-    let _ = w.event(&Event::BallStruck, at(100));
+    // While a ball is detected, 120 s until the result or ready.
+    let _ = w.event(&Event::BallDetected, at(100));
     assert_eq!(w.check(at(140)), Quiet::Warn(Duration::from_secs(40)));
     assert_eq!(w.check(at(219)), Quiet::Fine);
     assert_eq!(w.check(at(220)), Quiet::Lost(Duration::from_secs(120)));
 
     // Heartbeats in between keep the longer limit until the result.
     let mut w = Watchdog::new(SILENCE, t0);
-    let _ = w.event(&Event::BallStruck, at(0));
+    let _ = w.event(&Event::BallDetected, at(0));
     let _ = w.event(&Event::Heartbeat, at(20));
     assert_eq!(w.check(at(75)), Quiet::Warn(Duration::from_secs(55)));
     assert_eq!(w.check(at(139)), Quiet::Fine);
@@ -49,7 +49,7 @@ fn silence_is_allowed_90s_and_120s_after_a_strike() {
     assert_eq!(w.check(at(231)), Quiet::Lost(Duration::from_secs(90)));
 
     // Ready again also ends the longer limit.
-    let _ = w.event(&Event::BallStruck, at(240));
+    let _ = w.event(&Event::BallDetected, at(240));
     let _ = w.event(&Event::PuttReady, at(241));
     assert_eq!(w.check(at(331)), Quiet::Lost(Duration::from_secs(90)));
 }

@@ -12,7 +12,7 @@
 //! | `FindMat,101` | [`Event::FindingMat`] |
 //! | `MatOK,102` | [`Event::MatFound`] |
 //! | `PuttReady,106` | [`Event::PuttReady`] |
-//! | `PuttShot,107` | [`Event::BallStruck`] |
+//! | `PuttShot,107` | [`Event::BallDetected`] |
 //! | `IndiCator,109` | [`Event::Indicator`] |
 //! | `IndiCatorOut,110` | [`Event::IndicatorOut`] |
 //! | `PuttResult,<16 numbers>` | [`Event::PuttResult`] |
@@ -48,8 +48,9 @@ pub enum Event {
     MatFound,
     /// `PuttReady`: ready for a putt.
     PuttReady,
-    /// `PuttShot`: the ball was struck. Can fire without a putt following.
-    BallStruck,
+    /// `PuttShot`: the device sees a ball in place on the mat (sent when the
+    /// ball is set down, not at the stroke). Can fire without a putt following.
+    BallDetected,
     /// `IndiCator`: device indicator signal.
     Indicator,
     /// `IndiCatorOut`: device indicator cleared. Also sent in answer to
@@ -146,7 +147,7 @@ impl Event {
             "FindMat" => Self::FindingMat,
             "MatOK" => Self::MatFound,
             "PuttReady" => Self::PuttReady,
-            "PuttShot" => Self::BallStruck,
+            "PuttShot" => Self::BallDetected,
             "IndiCator" => Self::Indicator,
             "IndiCatorOut" => Self::IndicatorOut,
             "PuttResult" => Self::PuttResult(PuttResult::parse(args)?),
@@ -284,7 +285,7 @@ mod tests {
         assert_eq!(event("FindMat,101"), Event::FindingMat);
         assert_eq!(event("MatOK,102"), Event::MatFound);
         assert_eq!(event("PuttReady,106"), Event::PuttReady);
-        assert_eq!(event("PuttShot,107"), Event::BallStruck);
+        assert_eq!(event("PuttShot,107"), Event::BallDetected);
         assert_eq!(event("IndiCator,109"), Event::Indicator);
         assert_eq!(event("IndiCatorOut,110"), Event::IndicatorOut);
     }

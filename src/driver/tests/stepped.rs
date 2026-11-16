@@ -9,7 +9,7 @@ use super::*;
 use crate::testing::FakeDevice;
 
 const PUTT_READY: &str = "PuttReady,106";
-const BALL_STRUCK: &str = "PuttShot,107";
+const BALL_DETECTED: &str = "PuttShot,107";
 const HEARTBEAT: &str = "Test,yy";
 
 /// A driver with the device's defaults.
@@ -227,7 +227,7 @@ fn putts_are_putter_shots_numbered_in_order() {
     };
     assert_eq!(trigger.key.shot_number, 1);
     assert!([k1, k2, k3].iter().all(|k| **k == trigger.key));
-    assert_eq!(trigger.timestamp, None, "no strike seen, no strike time");
+    assert_eq!(trigger.timestamp, None);
     assert_eq!(*launch, launch_of(&putt(PUTT_RESULT_FULL)));
     assert_eq!(Some(club.clone()), club_of(&putt(PUTT_RESULT_FULL)));
 
@@ -248,31 +248,18 @@ fn putts_are_putter_shots_numbered_in_order() {
     );
 }
 
+/// The device does not report the stroke (its ball message comes when the
+/// ball is set down), so a putt's trigger carries no timestamp.
 #[test]
-fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
+fn a_putt_carries_no_strike_time() {
     let mut host = TestHost::new();
     let mut driver = driver();
     let (mut s, device) = measuring(&mut host, &mut driver);
 
-    let before = utc_ms().expect("clock");
-    device.push_event(BALL_STRUCK);
+    device.push_event(BALL_DETECTED);
     settle(&mut host, &mut s);
-    let after = utc_ms().expect("clock");
+    host.advance(Duration::from_secs(10));
     device.push_event(PUTT_RESULT_FULL);
-    settle(&mut host, &mut s);
-    let events = shot(&host.take());
-    let FrpBody::ShotTrigger(ShotTrigger {
-        timestamp: Some(at),
-        ..
-    }) = &events[0]
-    else {
-        panic!("{events:?}");
-    };
-    assert!((before..=after).contains(at), "{before} <= {at} <= {after}");
-
-    for comment in [PUTT_READY, BALL_STRUCK, PUTT_READY, PUTT_RESULT_FULL] {
-        device.push_event(comment);
-    }
     settle(&mut host, &mut s);
     let events = shot(&host.take());
     assert!(
@@ -287,7 +274,7 @@ fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
     );
 }
 
-/// The device sends no ready message after a putt, so a strike and a result
+/// The device sends no ready message after a putt, so a detected ball and a result
 /// leave it armed, and `device_state` is `ready` again with the result.
 #[test]
 fn a_putt_without_a_ready_message_keeps_the_device_armed() {
@@ -295,31 +282,31 @@ fn a_putt_without_a_ready_message_keeps_the_device_armed() {
     let mut driver = driver();
     let (mut s, device) = measuring(&mut host, &mut driver);
 
-    device.push_event(BALL_STRUCK);
+    device.push_event(BALL_DETECTED);
     settle(&mut host, &mut s);
     assert_eq!(
         states(&host.take()),
-        [(true, Some("ball struck".to_owned()))]
+        [(true, Some("ball detected".to_owned()))]
     );
 
     device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
     assert_eq!(states(&host.take()), [(true, Some("ready".to_owned()))]);
 
-    // Putts with neither a strike nor a ready message.
+    // Putts with neither a detected ball nor a ready message.
     device.push_event(PUTT_RESULT_FULL);
     device.push_event(PUTT_RESULT_PULLED);
     settle(&mut host, &mut s);
     assert!(states(&host.take()).iter().all(|(ready, _)| *ready));
 
     // A ready message sets the state too, and leaves the device armed.
-    device.push_event(BALL_STRUCK);
+    device.push_event(BALL_DETECTED);
     device.push_event(PUTT_READY);
     settle(&mut host, &mut s);
     assert_eq!(
         states(&host.take()),
         [
-            (true, Some("ball struck".to_owned())),
+            (true, Some("ball detected".to_owned())),
             (true, Some("ready".to_owned()))
         ]
     );
@@ -396,7 +383,7 @@ fn a_lost_session_is_retried_quickly_and_shot_numbers_go_on() {
 }
 
 /// Silence: not ready from 10 s until the device sends again, lost at 90 s
-/// (120 s after a strike), and the next attempt waits the stall wait. The
+/// (120 s while a ball is detected), and the next attempt waits the stall wait. The
 /// client's keepalives go on meanwhile; they are no data from the device.
 #[test]
 fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
@@ -427,15 +414,15 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
         "device sent data again after 10.0s"
     ));
 
-    // After a strike the limit is 120 s.
-    device.push_event(BALL_STRUCK);
+    // While a ball is detected the limit is 120 s.
+    device.push_event(BALL_DETECTED);
     settle(&mut host, &mut s);
-    let struck = host.now();
+    let detected = host.now();
     let error = host
         .run_for(Duration::from_secs(200), |now, out| s.step(now, out))
         .unwrap_err();
-    assert!(matches!(error, Error::Silent(d) if d == SILENCE.after_strike));
-    assert_eq!(host.now() - struck, SILENCE.after_strike);
+    assert!(matches!(error, Error::Silent(d) if d == SILENCE.with_ball));
+    assert_eq!(host.now() - detected, SILENCE.with_ball);
     assert!(
         requests(&device, 0).len() < mark(&device),
         "keepalives went out"
@@ -453,7 +440,7 @@ fn a_silent_device_is_not_ready_from_10s_and_lost_at_90s() {
     });
     assert_eq!(delay, Some(STALL_RECONNECT_WAIT));
 
-    // Without a strike, 90 s.
+    // Without a ball detected, 90 s.
     host.take();
     let (mut s, _device) = measuring(&mut host, &mut driver);
     let opened = host.now();

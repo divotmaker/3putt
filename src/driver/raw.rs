@@ -33,7 +33,7 @@ pub(super) fn classify(dir: Direction, body: &[u8]) -> Frame {
                 Event::FindingMat => Frame::Shared("FindMat"),
                 Event::MatFound => Frame::Shared("MatOK"),
                 Event::PuttReady => Frame::Shared("PuttReady"),
-                Event::BallStruck => Frame::Shared("PuttShot"),
+                Event::BallDetected => Frame::Shared("PuttShot"),
                 Event::Indicator => Frame::Shared("IndiCator"),
                 Event::IndicatorOut => Frame::Shared("IndiCatorOut"),
                 Event::PuttResult(_) => Frame::Shared(PUTT_RESULT_LABEL),

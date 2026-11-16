@@ -286,9 +286,9 @@ impl Idle {
 pub(super) struct SilenceLimits {
     /// Longest silence before the session is treated as lost.
     pub(super) baseline: Duration,
-    /// Longest silence after a strike, until the putt's result or the device
-    /// is ready again.
-    pub(super) after_strike: Duration,
+    /// Longest silence while a ball is detected, until the putt's result or the
+    /// device is ready again.
+    pub(super) with_ball: Duration,
     /// Silence after which one warning is logged and `ready` turns false.
     pub(super) warn_after: Duration,
 }
@@ -309,7 +309,7 @@ pub(super) enum Quiet {
 pub(super) struct Watchdog {
     limits: SilenceLimits,
     last: Instant,
-    /// A strike was seen and its result has not arrived yet.
+    /// A ball is down and no putt result has arrived yet.
     awaiting_result: bool,
     /// The current quiet spell has been warned about.
     warned: bool,
@@ -329,7 +329,7 @@ impl Watchdog {
     /// it ends when that spell was warned about.
     pub(super) fn event(&mut self, event: &Event, now: Instant) -> Option<Duration> {
         match event {
-            Event::BallStruck => self.awaiting_result = true,
+            Event::BallDetected => self.awaiting_result = true,
             Event::PuttResult(_) | Event::PuttReady => self.awaiting_result = false,
             _ => {}
         }
@@ -341,7 +341,7 @@ impl Watchdog {
     /// The silence allowed right now.
     pub(super) fn limit(&self) -> Duration {
         if self.awaiting_result {
-            self.limits.after_strike
+            self.limits.with_ball
         } else {
             self.limits.baseline
         }

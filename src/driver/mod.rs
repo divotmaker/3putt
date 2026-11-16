@@ -10,10 +10,12 @@
 //! the `not_armed` blocker while there is no mat (none found yet, or a mat
 //! search is running or waiting its turn) or the device is silent, none
 //! otherwise, and the `device_state` telemetry key (`finding mat`,
-//! `mat found`, `ready`, `ball struck`; `unknown` until the device names a
+//! `mat found`, `ready`, `ball detected`; `unknown` until the device names a
 //! state). The device sends a ready message only after some putts, so
 //! putting never makes the status `not_armed`: `device_state` reads `ball
-//! struck` from the strike to the putt's result, then `ready`.
+//! detected` from when a ball is set down to the putt's result, then `ready`.
+//! The device does not report when the ball is struck, so a putt's
+//! `shot.trigger` carries no timestamp.
 //!
 //! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
 //! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
@@ -49,7 +51,7 @@
 //! The device's app can stop answering for half a minute or more and then
 //! carry on, so the driver gives it time:
 //!
-//! - A session may stay silent for 90 s, and 120 s after a strike until the
+//! - A session may stay silent for 90 s, and 120 s while a ball is detected until the
 //!   putt's result or the device is ready again. The `not_armed` blocker is
 //!   reported from 10 s of silence until the device sends again. Past the limit the
 //!   session ends with [`Error::Silent`].
@@ -130,7 +132,7 @@ pub const DISCOVERY_HINT: &str = "ExPutt not found on this network. If it is on 
 /// alone. The `not_armed` blocker is reported from the warning on.
 const SILENCE: SilenceLimits = SilenceLimits {
     baseline: Duration::from_secs(90),
-    after_strike: Duration::from_secs(120),
+    with_ball: Duration::from_secs(120),
     warn_after: Duration::from_secs(10),
 };
 
@@ -380,7 +382,6 @@ impl ExPutt {
             device_state: None,
             silent: false,
             mat_search: Some((started, true)),
-            struck_at: None,
             hold_to_log: false,
             totals: Arc::clone(&self.totals),
         };
@@ -552,9 +553,6 @@ pub struct ExPuttSession<S> {
     /// The mat search in progress, when it started, and whether it is the
     /// session's own (whose time includes connect and handshake).
     mat_search: Option<(Instant, bool)>,
-    /// When the ball was struck (UTC ms), until the putt's result or the
-    /// device is ready again.
-    struck_at: Option<u64>,
     /// A hint or action asked for a mat search since the last step, which
     /// logs whether it is held back.
     hold_to_log: bool,
@@ -650,7 +648,7 @@ impl<S: Read + Write> ExPuttSession<S> {
                 putt.raw,
             ),
         );
-        out.shot_trigger(key.clone(), self.struck_at.take());
+        out.shot_trigger(key.clone(), None);
         out.launch(key.clone(), launch_of(putt));
         if let Some(club) = club_of(putt) {
             out.club(key.clone(), club);
@@ -688,16 +686,14 @@ impl<S: Read + Write> ExPuttSession<S> {
             }
             Event::PuttReady => {
                 out.log(Level::Info, "ready for a putt");
-                self.struck_at = None;
                 self.has_mat = true;
                 Some("ready")
             }
-            Event::BallStruck => {
-                out.log(Level::Info, "ball struck");
-                self.struck_at = utc_ms();
+            Event::BallDetected => {
+                out.log(Level::Info, "ball detected");
                 self.has_mat = true;
                 self.idle.active(now);
-                Some("ball struck")
+                Some("ball detected")
             }
             Event::Heartbeat => None,
             Event::PuttResult(putt) => {
