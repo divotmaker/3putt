@@ -221,6 +221,37 @@ impl ResyncGate {
     }
 }
 
+/// Notices a session that has had no putt and no mat search for a while: the
+/// device stops detecting putts after being left idle, and a mat search wakes
+/// it.
+#[derive(Debug)]
+pub(super) struct Idle {
+    after: Duration,
+    /// The last putt or mat search, or the start of the session.
+    since: Instant,
+}
+
+impl Idle {
+    pub(super) fn new(after: Duration, now: Instant) -> Self {
+        Self { after, since: now }
+    }
+
+    /// A putt or a mat search at `now`.
+    pub(super) fn active(&mut self, now: Instant) {
+        self.since = now;
+    }
+
+    /// The session has been idle for the whole time at `now`: true once, then
+    /// the time counts again from `now`.
+    pub(super) fn due(&mut self, now: Instant) -> bool {
+        let idle = now.saturating_duration_since(self.since) >= self.after;
+        if idle {
+            self.since = now;
+        }
+        idle
+    }
+}
+
 /// How long a measuring session may go without a device event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SilenceLimits {

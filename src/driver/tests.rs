@@ -203,6 +203,22 @@ fn mat_searches_are_spaced_and_coalesced() {
 }
 
 #[test]
+fn a_session_is_idle_after_five_minutes_without_a_putt_or_mat_search() {
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    let mut idle = Idle::new(Duration::from_secs(300), t0);
+    assert!(!idle.due(at(299)));
+    assert!(idle.due(at(300)));
+    assert!(!idle.due(at(301)), "once, then it counts again");
+    assert!(!idle.due(at(599)));
+
+    // A putt or a mat search starts the time over.
+    idle.active(at(500));
+    assert!(!idle.due(at(799)));
+    assert!(idle.due(at(800)));
+}
+
+#[test]
 fn the_user_is_told_once_per_outage_that_the_device_is_not_answering() {
     let t0 = Instant::now();
     let at = |s: u64| t0 + Duration::from_secs(s);

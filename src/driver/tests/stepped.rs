@@ -629,6 +629,51 @@ fn find_mat_resyncs_the_device_and_a_slow_search_is_logged() {
     );
 }
 
+/// Five minutes without a putt or a mat search: the driver finds the mat.
+/// A putt starts the time over.
+#[test]
+fn an_idle_session_finds_the_mat_to_keep_the_device_awake() {
+    let mut host = TestHost::new();
+    let mut driver = driver();
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    let before = mark(&device);
+
+    live_for(&mut host, &mut s, &device, IDLE_AFTER / 2);
+    device.push_event(PUTT_RESULT_FULL);
+    live_for(
+        &mut host,
+        &mut s,
+        &device,
+        IDLE_AFTER.saturating_sub(Duration::from_secs(1)),
+    );
+    assert_eq!(requests(&device, before), Vec::<String>::new());
+    host.take();
+
+    live_for(&mut host, &mut s, &device, Duration::from_secs(1));
+    assert_eq!(requests(&device, before), round("setDexterityRight"));
+    let seen = host.take();
+    assert!(logged(
+        &seen,
+        Level::Info,
+        "ExPutt idle 5 min, re-finding the mat to keep it awake"
+    ));
+    assert_eq!(
+        device_states(&seen),
+        ["ready", "finding mat", "mat found", "ready"]
+    );
+    assert_eq!(ready(&seen), Some(true));
+
+    // The search was activity: the next one is 5 minutes later.
+    let before = mark(&device);
+    live_for(
+        &mut host,
+        &mut s,
+        &device,
+        IDLE_AFTER.saturating_sub(Duration::from_secs(1)),
+    );
+    assert_eq!(requests(&device, before), Vec::<String>::new());
+}
+
 /// Each failed attempt alerts, until two minutes of unanswered attempts:
 /// then one "not answering" alert, and quiet until a session succeeds.
 #[test]

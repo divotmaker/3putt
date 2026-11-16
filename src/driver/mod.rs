@@ -41,6 +41,9 @@
 //! into the latest hand and one mat search. The `not_armed` blocker is
 //! reported while one waits.
 //!
+//! A session with no putt and no mat search for 5 minutes runs a mat search
+//! too: a device left idle stops detecting putts, and a mat search wakes it.
+//!
 //! # A device that stalls
 //!
 //! The device's app can stop answering for half a minute or more and then
@@ -99,7 +102,7 @@ use crate::config::Config;
 use crate::event::{Event, PuttResult};
 use crate::packet::{Hand, Request};
 use policy::{
-    Memory, Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog,
+    Idle, Memory, Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog,
 };
 use raw::{Frame, PUTT_RESULT_LABEL, classify};
 use tuning::Tuning;
@@ -148,6 +151,10 @@ const NOT_ANSWERING_AFTER: Duration = Duration::from_secs(120);
 /// The alert raised once per outage of a device that accepts connections and
 /// never answers.
 const NOT_ANSWERING: &str = "The ExPutt is not answering. If this lasts, turn it off and on again.";
+
+/// How long a session may go without a putt or a mat search before the driver
+/// runs a mat search, which keeps the device detecting putts.
+const IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// A mat search in a running session that takes longer than this is logged as
 /// a warning.
@@ -338,6 +345,7 @@ impl ExPutt {
             ids: self.ids.clone(),
             watchdog: Watchdog::new(SILENCE, now),
             gate: ResyncGate::new(RESYNC_GAP, hand, now),
+            idle: Idle::new(IDLE_AFTER, now),
             has_mat: false,
             device_state: None,
             silent: false,
@@ -484,6 +492,7 @@ pub struct ExPuttSession<S> {
     ids: ShotIds,
     watchdog: Watchdog,
     gate: ResyncGate,
+    idle: Idle,
     /// The device has a mat: its search found one, or it reported a putt.
     /// False from the start of a mat search; the status also depends on a
     /// waiting mat search and on silence.
@@ -640,12 +649,14 @@ impl<S: Read + Write> ExPuttSession<S> {
                 out.log(Level::Info, "ball struck");
                 self.struck_at = utc_ms();
                 self.has_mat = true;
+                self.idle.active(now);
                 Some("ball struck")
             }
             Event::Heartbeat => None,
             Event::PuttResult(putt) => {
                 self.emit_putt(out, &putt);
                 self.has_mat = true;
+                self.idle.active(now);
                 Some("ready")
             }
             Event::Unknown { packet_id, comment } => {
@@ -748,8 +759,16 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
             self.log_hold(out, now);
         }
 
+        if self.idle.due(now) {
+            out.log(
+                Level::Info,
+                "ExPutt idle 5 min, re-finding the mat to keep it awake",
+            );
+            self.gate.want_find();
+        }
         // A mat search runs at most once per gap, with the latest hand.
         if let Some(search) = self.gate.due(now) {
+            self.idle.active(now);
             match search {
                 Resync::Restart(hand) => {
                     out.log(Level::Info, format!("hand -> {hand:?}, finding the mat"));
