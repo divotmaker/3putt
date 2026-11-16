@@ -36,6 +36,8 @@ struct Pump {
     listener: TcpListener,
     conn: Option<TcpStream>,
     device: FakeDevice,
+    /// The device announces itself on every tick.
+    beacons: bool,
     /// The driver closed its sending direction.
     ended: bool,
     ticks: u32,
@@ -53,6 +55,7 @@ impl Pump {
             listener,
             conn: None,
             device,
+            beacons: true,
             ended: false,
             ticks: 0,
         }
@@ -65,13 +68,22 @@ impl Pump {
         }
     }
 
+    /// A new device on the same sockets, the old connection forgotten.
+    fn replace_device(&mut self, device: FakeDevice) {
+        self.device = device;
+        self.conn = None;
+        self.ended = false;
+    }
+
     fn pump(&mut self) {
         self.ticks += 1;
         assert!(self.ticks < GIVE_UP, "the sockets never delivered");
         let beacon = r#"{"_serverUUID":"00000000-0000-4000-8000-000000000001","_ipAddress":"127.0.0.1","_appVersion":"1.2.3"}"#;
-        let _ = self
-            .beacon
-            .send_to(beacon.as_bytes(), ("127.0.0.1", self.discovery_port));
+        if self.beacons {
+            let _ = self
+                .beacon
+                .send_to(beacon.as_bytes(), ("127.0.0.1", self.discovery_port));
+        }
         if self.conn.is_none()
             && let Ok((conn, _)) = self.listener.accept()
         {
@@ -216,4 +228,66 @@ fn discovery_without_a_device_hints_once_and_stops_at_the_stop() {
         })
         .collect();
     assert_eq!(alerts, [(Severity::Warn, DISCOVERY_HINT)]);
+}
+
+/// Connect `driver` through `pump`, and the phases the connect went through.
+fn connect(
+    driver: &mut ExPutt,
+    pump: &mut Pump,
+) -> (Result<ExPuttSession<TcpStream>, Error>, Vec<&'static str>) {
+    let (stop, flags) = (Stop::new(), HostFlags::new());
+    let mut events = Vec::new();
+    let result = {
+        let mut sink = |e: DeviceEvent| events.push(e);
+        let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), pump);
+        driver.connect(&mut ctx)
+    };
+    let phases = events
+        .iter()
+        .filter_map(|e| match e {
+            DeviceEvent::Phase(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    (result, phases)
+}
+
+/// A device that announced itself once is reconnected at its address, with
+/// no beacon; it is the address, not a beacon, that the next connect needs.
+#[test]
+fn the_last_device_is_reconnected_without_a_beacon() {
+    let mut pump = Pump::new(FakeDevice::new());
+    let mut driver = ExPutt::with_tuning(Config::default(), pump.tuning()).expect("driver");
+    let (first, phases) = connect(&mut driver, &mut pump);
+    assert_eq!(phases, ["discovering", "connecting", "measuring"]);
+    drop(first.expect("connect"));
+
+    pump.beacons = false;
+    pump.replace_device(FakeDevice::new());
+    let (second, phases) = connect(&mut driver, &mut pump);
+    assert_eq!(phases, ["connecting", "measuring"], "no discovery");
+    assert_eq!(
+        second.expect("connect").identity().device,
+        "ExPutt RG (127.0.0.1)"
+    );
+}
+
+/// A device that is no longer at the remembered address costs one failed
+/// connect, then it is looked for on the network.
+#[test]
+fn a_device_that_moved_is_found_by_its_beacon() {
+    let mut pump = Pump::new(FakeDevice::new());
+    let mut driver = ExPutt::with_tuning(Config::default(), pump.tuning()).expect("driver");
+    // Nothing listens on this address at the device's port.
+    driver.memory.set_address("127.0.0.2".parse().unwrap());
+    let (session, phases) = connect(&mut driver, &mut pump);
+    assert_eq!(
+        phases,
+        ["connecting", "discovering", "connecting", "measuring"]
+    );
+    assert_eq!(
+        session.expect("connect").identity().device,
+        "ExPutt RG (127.0.0.1)"
+    );
+    assert_eq!(driver.memory.address(), Some("127.0.0.1".parse().unwrap()));
 }

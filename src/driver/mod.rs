@@ -1,7 +1,8 @@
 //! The flightrelay `FrpDriver` for the ExPutt RG (`driver` feature).
 //!
-//! [`ExPutt`] finds the device on the network (or uses
-//! [`Config::address`]), runs a [`Client`] session with the player's hand, and
+//! [`ExPutt`] connects to [`Config::address`]; with none set it tries the
+//! address of the last device this process connected to, then finds the device
+//! on the network. It runs a [`Client`] session with the player's hand, and
 //! turns every putt into an FRP shot: `shot.trigger`, `shot.launch` (ball
 //! speed and launch direction), `shot.club` (putter path and face angle, when
 //! the putter was tracked) and `shot.finished`. The device measures no
@@ -97,7 +98,9 @@ use crate::client::{Client, Direction, hang_up};
 use crate::config::Config;
 use crate::event::{Event, PuttResult};
 use crate::packet::{Hand, Request};
-use policy::{Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog};
+use policy::{
+    Memory, Quiet, Resync, ResyncGate, Retry, SilenceLimits, Totals, Unanswered, Watchdog,
+};
 use raw::{Frame, PUTT_RESULT_LABEL, classify};
 use tuning::Tuning;
 
@@ -200,6 +203,8 @@ pub struct ExPutt {
     retry: Retry,
     unanswered: Unanswered,
     totals: Arc<Totals>,
+    /// What this process remembers across drivers.
+    memory: Memory,
 }
 
 #[cfg(test)]
@@ -237,6 +242,16 @@ impl ExPutt {
         let ip = self.ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let started = connecting(ctx, ip);
         self.open(ctx, stream, ip, None, started, |_| {})
+    }
+
+    /// Open the TCP connection to the device at `ip`.
+    fn dial(&self, ctx: &mut ConnectCtx<'_>, ip: IpAddr) -> Result<TcpStream, Error> {
+        let stream = ctx
+            .connect_tcp(SocketAddr::new(ip, self.tuning.port), CONNECT_TIMEOUT)?
+            .map_err(crate::Error::Io)?;
+        let _ = stream.set_nodelay(true);
+        stream.set_nonblocking(true).map_err(crate::Error::Io)?;
+        Ok(stream)
     }
 
     /// Wait for the device to announce itself on the network, on one
@@ -362,6 +377,7 @@ impl FrpDriver for ExPutt {
             tuning,
             retry: Retry::default(),
             totals: Arc::new(Totals::default()),
+            memory: Memory::process(),
         })
     }
 
@@ -380,19 +396,38 @@ impl FrpDriver for ExPutt {
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ExPuttSession<TcpStream>, Error> {
         ctx.tick()?;
-        let (ip, firmware) = if let Some(ip) = self.ip {
-            (ip, None)
+        // The address to use: the configured one, else the last device's,
+        // else what discovery finds. A device that no longer answers at the
+        // remembered address is looked for on the network.
+        let mut dialed = None;
+        if self.ip.is_none()
+            && let Some(ip) = self.memory.address()
+        {
+            let started = connecting(ctx, ip);
+            match self.dial(ctx, ip) {
+                Ok(stream) => dialed = Some((ip, None, started, stream)),
+                Err(Error::Stopped) => return Err(Error::Stopped),
+                Err(e) => ctx.out.log(
+                    Level::Info,
+                    format!("no ExPutt at {ip} ({e}), looking for it on the network"),
+                ),
+            }
+        }
+        let (ip, firmware, started, stream) = if let Some(dialed) = dialed {
+            dialed
         } else {
-            let beacon = self.discover(ctx)?;
-            (beacon.ip, beacon.app_version)
+            let (ip, firmware) = if let Some(ip) = self.ip {
+                (ip, None)
+            } else {
+                let beacon = self.discover(ctx)?;
+                (beacon.ip, beacon.app_version)
+            };
+            let started = connecting(ctx, ip);
+            (ip, firmware, started, self.dial(ctx, ip)?)
         };
-        let started = connecting(ctx, ip);
-        let stream = ctx
-            .connect_tcp(SocketAddr::new(ip, self.tuning.port), CONNECT_TIMEOUT)?
-            .map_err(crate::Error::Io)?;
-        let _ = stream.set_nodelay(true);
-        stream.set_nonblocking(true).map_err(crate::Error::Io)?;
-        self.open(ctx, stream, ip, firmware, started, hang_up)
+        let session = self.open(ctx, stream, ip, firmware, started, hang_up)?;
+        self.memory.set_address(ip);
+        Ok(session)
     }
 
     /// The device's own reconnect policy: the host's backoff, shortened for

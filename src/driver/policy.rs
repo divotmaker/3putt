@@ -2,7 +2,9 @@
 //! outage, mat search spacing and the silence watchdog. Each takes `now`
 //! from its caller.
 
+use std::net::IpAddr;
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use flightrelay::driver::Backoff;
@@ -21,6 +23,42 @@ pub(super) const QUICK_RETRIES: u32 = 3;
 pub(super) struct Totals {
     pub(super) connects: AtomicU32,
     pub(super) resyncs: AtomicU32,
+}
+
+/// What the driver remembers for the life of the process. A host that stops a
+/// driver (Reconnect, a card turned off) builds a new one for the next start,
+/// so this is shared by every driver of the process.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Memory(Arc<Mutex<Remembered>>);
+
+#[derive(Debug, Default)]
+struct Remembered {
+    /// The address of the last device a session was set up with.
+    address: Option<IpAddr>,
+}
+
+impl Memory {
+    /// The memory of this process; a test gets a fresh one.
+    pub(super) fn process() -> Self {
+        static PROCESS: LazyLock<Memory> = LazyLock::new(Memory::default);
+        if cfg!(test) {
+            Self::default()
+        } else {
+            PROCESS.clone()
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Remembered> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn address(&self) -> Option<IpAddr> {
+        self.lock().address
+    }
+
+    pub(super) fn set_address(&self, ip: IpAddr) {
+        self.lock().address = Some(ip);
+    }
 }
 
 /// Reconnect delays: the host's backoff, shortened for the first
