@@ -287,28 +287,71 @@ fn a_strike_dates_the_shot_and_a_strike_taken_back_dates_nothing() {
     );
 }
 
+/// The device sends no ready message after a putt, so a strike and a result
+/// leave it armed, and `device_state` is `ready` again with the result.
 #[test]
-fn readiness_follows_the_putt_cycle() {
+fn a_putt_without_a_ready_message_keeps_the_device_armed() {
     let mut host = TestHost::new();
     let mut driver = driver();
     let (mut s, device) = measuring(&mut host, &mut driver);
 
-    // Struck: not ready until the device says so again.
     device.push_event(BALL_STRUCK);
     settle(&mut host, &mut s);
     assert_eq!(
         states(&host.take()),
-        [(false, Some("ball struck".to_owned()))]
+        [(true, Some("ball struck".to_owned()))]
     );
 
-    // The result changes neither value.
     device.push_event(PUTT_RESULT_FULL);
     settle(&mut host, &mut s);
-    assert_eq!(states(&host.take()), []);
+    assert_eq!(states(&host.take()), [(true, Some("ready".to_owned()))]);
 
+    // Putts with neither a strike nor a ready message.
+    device.push_event(PUTT_RESULT_FULL);
+    device.push_event(PUTT_RESULT_PULLED);
+    settle(&mut host, &mut s);
+    assert!(states(&host.take()).iter().all(|(ready, _)| *ready));
+
+    // A ready message sets the state too, and leaves the device armed.
+    device.push_event(BALL_STRUCK);
     device.push_event(PUTT_READY);
     settle(&mut host, &mut s);
-    assert_eq!(states(&host.take()), [(true, Some("ready".to_owned()))]);
+    assert_eq!(
+        states(&host.take()),
+        [
+            (true, Some("ball struck".to_owned())),
+            (true, Some("ready".to_owned()))
+        ]
+    );
+}
+
+/// Not armed from the start of a mat search until it finds the mat.
+#[test]
+fn a_mat_search_is_not_armed_until_the_mat_is_found() {
+    let mut host = TestHost::new();
+    let mut driver = driver();
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    live_for(&mut host, &mut s, &device, RESYNC_GAP);
+    host.take();
+
+    device.set_find_mat(false);
+    host.with(|_, out| s.action(&Action::FindMat, out))
+        .expect("action");
+    settle(&mut host, &mut s);
+    assert_eq!(ready(&host.take()), Some(false));
+    device.push_event("FindMat,101");
+    settle(&mut host, &mut s);
+    assert_eq!(
+        states(&host.take()),
+        [(false, Some("finding mat".to_owned()))]
+    );
+    device.push_event("MatOK,102");
+    settle(&mut host, &mut s);
+    // Armed with the mat, before the device's ready message.
+    assert_eq!(
+        states(&host.take())[0],
+        (true, Some("mat found".to_owned()))
+    );
 }
 
 /// A device that closes the connection ends the session; the next attempt

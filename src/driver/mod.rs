@@ -6,10 +6,13 @@
 //! speed and launch direction), `shot.club` (putter path and face angle, when
 //! the putter was tracked) and `shot.finished`. The device measures no
 //! vertical launch and no spin, so the launch carries neither. Its status is
-//! the `not_armed` blocker whenever the device is not ready for a putt (none
-//! when it is), and the `device_state` telemetry key (`finding mat`,
+//! the `not_armed` blocker while there is no mat (none found yet, or a mat
+//! search is running or waiting its turn) or the device is silent, none
+//! otherwise, and the `device_state` telemetry key (`finding mat`,
 //! `mat found`, `ready`, `ball struck`; `unknown` until the device names a
-//! state).
+//! state). The device sends a ready message only after some putts, so
+//! putting never makes the status `not_armed`: `device_state` reads `ball
+//! struck` from the strike to the putt's result, then `ready`.
 //!
 //! A host runs it as a launch monitor actor with flightrelay's `FrpServer`
 //! (feature `frp` builds the `threeputt-frp` binary on `flightrelay::run`),
@@ -320,7 +323,7 @@ impl ExPutt {
             ids: self.ids.clone(),
             watchdog: Watchdog::new(SILENCE, now),
             gate: ResyncGate::new(RESYNC_GAP, hand, now),
-            device_ready: false,
+            has_mat: false,
             device_state: None,
             silent: false,
             mat_search: Some((started, true)),
@@ -446,9 +449,10 @@ pub struct ExPuttSession<S> {
     ids: ShotIds,
     watchdog: Watchdog,
     gate: ResyncGate,
-    /// The last `ready` the device itself reported; the status also depends
-    /// on a waiting mat search and on silence.
-    device_ready: bool,
+    /// The device has a mat: its search found one, or it reported a putt.
+    /// False from the start of a mat search; the status also depends on a
+    /// waiting mat search and on silence.
+    has_mat: bool,
     /// The last state the device reported, the `device_state` telemetry.
     device_state: Option<&'static str>,
     /// The device has been silent past the warning threshold; not ready as
@@ -471,21 +475,21 @@ impl<S> std::fmt::Debug for ExPuttSession<S> {
         f.debug_struct("ExPuttSession")
             .field("client", &self.client)
             .field("identity", &self.identity)
-            .field("device_ready", &self.device_ready)
+            .field("has_mat", &self.has_mat)
             .field("device_state", &self.device_state)
             .finish_non_exhaustive()
     }
 }
 
 impl<S: Read + Write> ExPuttSession<S> {
-    /// Report the status: the `not_armed` blocker unless the device is ready
-    /// (it is not while a requested mat search waits or past the silence
-    /// warning), and `device_state`, which reads as its declared
+    /// Report the status: the `not_armed` blocker while there is no mat, a
+    /// requested mat search waits or past the silence warning, and
+    /// `device_state`, which reads as its declared
     /// `"unknown"` until the device names a state. That is the whole
     /// status: the device has no battery. The host publishes only what
     /// changed.
     fn report(&self, out: &mut Events<'_>) {
-        let ready = self.device_ready && !self.silent && !self.gate.pending();
+        let ready = self.has_mat && !self.silent && !self.gate.pending();
         let mut status = if ready {
             DeviceStatus::new()
         } else {
@@ -565,7 +569,7 @@ impl<S: Read + Write> ExPuttSession<S> {
         out.shot_finished(key);
     }
 
-    /// A device event at `now`: the watchdog, then readiness and the device
+    /// A device event at `now`: the watchdog, then the mat and the device
     /// state, reported when the event or the end of a silence moved either.
     fn handle(&mut self, out: &mut Events<'_>, event: Event, now: Instant) {
         let spell = self.watchdog.event(&event, now);
@@ -579,44 +583,51 @@ impl<S: Read + Write> ExPuttSession<S> {
                 ),
             );
         }
-        // (ready, device_state) the event sets; `None` leaves a value alone.
-        let (ready, device_state) = match event {
-            Event::FindingMat => (None, Some("finding mat")),
+        let had_mat = self.has_mat;
+        // The device_state the event sets; `None` leaves it alone.
+        let device_state = match event {
+            Event::FindingMat => {
+                self.has_mat = false;
+                Some("finding mat")
+            }
             Event::MatFound => {
                 self.log_mat_found(out, now);
-                (None, Some("mat found"))
+                self.has_mat = true;
+                Some("mat found")
             }
             Event::PuttReady => {
                 out.log(Level::Info, "ready for a putt");
                 self.struck_at = None;
-                (Some(true), Some("ready"))
+                self.has_mat = true;
+                Some("ready")
             }
             Event::BallStruck => {
                 out.log(Level::Info, "ball struck");
                 self.struck_at = utc_ms();
-                (Some(false), Some("ball struck"))
+                self.has_mat = true;
+                Some("ball struck")
             }
-            Event::Heartbeat => (None, None),
+            Event::Heartbeat => None,
             Event::PuttResult(putt) => {
                 self.emit_putt(out, &putt);
-                (None, None)
+                self.has_mat = true;
+                Some("ready")
             }
             Event::Unknown { packet_id, comment } => {
                 out.log(
                     Level::Debug,
                     format!("unrecognized event {packet_id}: {comment:?}"),
                 );
-                (None, None)
+                None
             }
             other => {
                 out.log(Level::Debug, format!("event {other:?}"));
-                (None, None)
+                None
             }
         };
-        if ready.is_none() && device_state.is_none() && spell.is_none() {
+        if device_state.is_none() && spell.is_none() && self.has_mat == had_mat {
             return;
         }
-        self.device_ready = ready.unwrap_or(self.device_ready);
         self.device_state = device_state.or(self.device_state);
         self.report(out);
     }
@@ -716,7 +727,7 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
             }
             self.totals.resyncs.fetch_add(1, Ordering::Relaxed);
             self.mat_search = Some((now, false));
-            self.device_ready = false;
+            self.has_mat = false;
             self.report(out);
         }
 
@@ -748,8 +759,8 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
     }
 
     /// Follow the golfer's handedness: a new round when it differs from the
-    /// device's hand, which finds the mat first, so the device is not ready
-    /// until it reports ready again. No handedness hint keeps the hand. The
+    /// device's hand, which finds the mat first, so the device is not armed
+    /// until the mat is found. No handedness hint keeps the hand. The
     /// mode and the club do not apply: the device only measures putts.
     fn hints(&mut self, hints: &TurnHints, out: &mut Events<'_>) -> Result<(), Error> {
         if let Some(handed) = hints.handedness {
