@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// The device's IP address. Unset or blank finds the device on the
     /// network by its discovery broadcast; anything else must be an IP
-    /// address (the device listens on port 8889).
+    /// address (the device listens on port 8889). A fixed address makes
+    /// reconnects dependable: a device that has had a client stops
+    /// broadcasting.
     #[serde(skip_serializing_if = "is_default")]
     pub address: Option<String>,
 }
