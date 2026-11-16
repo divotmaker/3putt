@@ -64,9 +64,9 @@
 //!   since the close, because a device connected to again at once answers the
 //!   handshake late or not at all. Its failure raises no alert.
 //! - Each failed attempt raises an "ExPutt error" `bus.alert`, until two minutes
-//!   of attempts the device accepted but never answered have passed. Then one
-//!   alert says the device is not answering, and the attempts go on quietly
-//!   until a session succeeds.
+//!   of failed attempts have passed (the device turned off, out of reach or
+//!   not answering). Then one alert says the device is not answering, and the
+//!   attempts go on quietly until a session succeeds.
 //!
 //! A stop ends a connect at once: discovery, the TCP connect and the
 //! handshake check for one on every pass. Closing says goodbye, then reads
@@ -150,13 +150,13 @@ const RESYNC_GAP: Duration = Duration::from_secs(10);
 // request: the client ignores a Find mat while a search waits for its mat.
 const _: () = assert!(RESYNC_GAP.as_millis() > crate::client::MAT_TIMEOUT.as_millis());
 
-/// How long connection attempts may fail to get an answer from a device that
-/// accepts the connection before the user is told.
+/// How long connection attempts may fail before the user is told.
 const NOT_ANSWERING_AFTER: Duration = Duration::from_secs(120);
 
-/// The alert raised once per outage of a device that accepts connections and
-/// never answers.
-const NOT_ANSWERING: &str = "The ExPutt is not answering. If this lasts, turn it off and on again.";
+/// The alert raised once per outage: the device can't be reached or never
+/// answers.
+const NOT_ANSWERING: &str =
+    "The ExPutt is not answering. Check that it is on; if it is, turn it off and on again.";
 
 /// How long a session may go without a putt or a mat search before the driver
 /// runs a mat search, which keeps the device detecting putts.
@@ -483,15 +483,15 @@ impl FrpDriver for ExPutt {
         out: &mut Events<'_>,
     ) -> Option<Duration> {
         let error = ended.error;
-        // A device that accepts the connection and never answers is not
-        // hammered (see `Retry`); the user is told once, and the per-attempt
+        // A device that can't be reached or never answers (turned off, out
+        // of range, wedged) is told to the user once, and the per-attempt
         // alerts stop until a session succeeds.
-        let mut tell_not_answering = false;
-        if ended.connected_for.is_some() {
+        let tell_not_answering = if ended.connected_for.is_some() {
             self.unanswered.recovered();
-        } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
-            tell_not_answering = self.unanswered.no_answer(ended.now);
-        }
+            false
+        } else {
+            self.unanswered.no_answer(ended.now)
+        };
         // The attempt that followed a close the host ended is the device's
         // to be slow with: no alert for it.
         let graced = self.memory.take_graced() && ended.connected_for.is_none();

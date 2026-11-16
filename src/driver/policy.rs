@@ -132,15 +132,14 @@ impl Retry {
     }
 }
 
-/// Tracks an outage: connection attempts that reach a device which accepts
-/// the connection but never answers. The clock starts at the first such
-/// attempt and runs until a session succeeds; attempts that fail some other
-/// way neither stop nor restart it, so a flapping outage is still reported.
+/// Tracks an outage: connection attempts that fail, however they fail. The
+/// clock starts at the first failed attempt and runs until a session
+/// succeeds.
 #[derive(Debug)]
 pub(super) struct Unanswered {
     /// How long the outage may go on before the user is told.
     pub(super) after: Duration,
-    /// When the first unanswered attempt of the outage happened.
+    /// When the first failed attempt of the outage happened.
     since: Option<Instant>,
     /// The user has been told about this outage.
     pub(super) told: bool,
@@ -155,7 +154,7 @@ impl Unanswered {
         }
     }
 
-    /// An attempt got no answer at `now`. Whether the user is to be told
+    /// An attempt failed at `now`. Whether the user is to be told
     /// now: once per outage.
     pub(super) fn no_answer(&mut self, now: Instant) -> bool {
         let since = *self.since.get_or_insert(now);

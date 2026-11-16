@@ -739,8 +739,9 @@ fn a_connect_after_the_hosts_close_waits_and_its_failure_raises_no_alert() {
     );
 }
 
-/// Each failed attempt alerts, until two minutes of unanswered attempts:
-/// then one "not answering" alert, and quiet until a session succeeds.
+/// Each failed attempt alerts, until two minutes of failed attempts, however
+/// they fail: then one "not answering" alert, and quiet until a session
+/// succeeds.
 #[test]
 fn the_user_is_told_once_that_the_device_is_not_answering() {
     let mut host = TestHost::new();
@@ -748,6 +749,8 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
     let mut backoff = Backoff::new(Duration::from_millis(50), Duration::from_secs(5));
     let timeout = Error::Device(crate::Error::Timeout("the device's handshake reply"));
     let refused = Error::Lost;
+    // A device turned off: the TCP connect itself times out.
+    let off = || Error::Device(crate::Error::Io(std::io::ErrorKind::TimedOut.into()));
     let mut attempt = |host: &mut TestHost, error: &Error, connected_for| {
         host.with(|now, out| {
             driver.retry_delay(
@@ -759,8 +762,8 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
         alert_messages(&host.take())
     };
     assert_eq!(
-        attempt(&mut host, &timeout, None),
-        ["ExPutt error: timed out waiting for the device's handshake reply"]
+        attempt(&mut host, &off(), None),
+        [format!("ExPutt error: {}", off())]
     );
     host.advance(Duration::from_secs(60));
     assert_eq!(
@@ -768,7 +771,7 @@ fn the_user_is_told_once_that_the_device_is_not_answering() {
         ["ExPutt error: connection to the device lost"]
     );
     host.advance(Duration::from_secs(60));
-    assert_eq!(attempt(&mut host, &timeout, None), [NOT_ANSWERING]);
+    assert_eq!(attempt(&mut host, &off(), None), [NOT_ANSWERING]);
     // Quiet while the outage lasts, attempts that fail another way included.
     for error in [&timeout, &refused, &timeout] {
         host.advance(Duration::from_secs(10));
