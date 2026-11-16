@@ -75,6 +75,7 @@ impl Memory {
     /// passed.
     pub(super) fn take_grace(&self, now: Instant, grace: Duration) -> Option<Duration> {
         let mut memory = self.lock();
+        memory.graced = false;
         let closed = memory.closed.take()?;
         let left = grace
             .checked_sub(now.saturating_duration_since(closed))

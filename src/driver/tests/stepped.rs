@@ -706,7 +706,6 @@ fn a_connect_after_the_hosts_close_waits_and_its_failure_raises_no_alert() {
         Level::Info,
         "waiting 2.0s after closing the last session"
     ));
-    assert_eq!(waited(&mut host, &mut driver), Duration::ZERO, "once");
 
     // The attempt after the wait fails: told in the log, not as an alert;
     // the next failure alerts.
@@ -725,6 +724,7 @@ fn a_connect_after_the_hosts_close_waits_and_its_failure_raises_no_alert() {
         Level::Info,
         "connect after closing the last session failed"
     ));
+    assert_eq!(waited(&mut host, &mut driver), Duration::ZERO, "once");
     assert_eq!(alert_messages(&attempt(&mut host, &mut driver)).len(), 1);
 
     // A session that failed is not a close the host ended.
@@ -734,6 +734,22 @@ fn a_connect_after_the_hosts_close_waits_and_its_failure_raises_no_alert() {
         .unwrap_err();
     host.with(|_, out| s.close(out));
     assert_eq!(waited(&mut host, &mut driver), Duration::ZERO);
+
+    // A graced connect that succeeds leaves no mark: a failure after
+    // a later close alerts.
+    let (s, _device) = measuring(&mut host, &mut driver);
+    host.with(|_, out| s.close(out));
+    assert!(waited(&mut host, &mut driver) > Duration::ZERO);
+    let (s, _device) = measuring(&mut host, &mut driver);
+    host.with(|_, out| s.close(out));
+    host.advance(CLOSE_GRACE + Duration::from_secs(1));
+    assert_eq!(waited(&mut host, &mut driver), Duration::ZERO);
+    host.take();
+    let alerts = alert_messages(&attempt(&mut host, &mut driver));
+    assert!(
+        alerts.iter().any(|a| a.starts_with("ExPutt error:")),
+        "{alerts:?}"
+    );
 }
 
 /// Each failed attempt alerts, until two minutes of unanswered attempts:
