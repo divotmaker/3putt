@@ -55,8 +55,12 @@
 //!   session ends with [`Error::Silent`].
 //! - After a session lost to silence, the next attempt waits at least 15 s,
 //!   and attempts stay at least 15 s apart until a session succeeds.
-//! - After a session that was measuring, the first three attempts wait at
+//! - After a session lost while measuring, the first three attempts wait at
 //!   most 1 s.
+//! - The first connect after a session its host ended (a reconnect, a card
+//!   turned off and on, a new configuration) waits until 3 s have passed
+//!   since the close, because a device connected to again at once answers the
+//!   handshake late or not at all. Its failure raises no alert.
 //! - Each failed attempt raises an "ExPutt error" `bus.alert`, until two minutes
 //!   of attempts the device accepted but never answered have passed. Then one
 //!   alert says the device is not answering, and the attempts go on quietly
@@ -156,6 +160,12 @@ const NOT_ANSWERING: &str = "The ExPutt is not answering. If this lasts, turn it
 /// runs a mat search, which keeps the device detecting putts.
 const IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// How long after the driver closed a session its host ended (a Reconnect, a
+/// card turned off and on, a new configuration) the next connect waits before
+/// it opens a connection. A device that is connected to again at once answers
+/// the handshake late or not at all.
+const CLOSE_GRACE: Duration = Duration::from_secs(3);
+
 /// A mat search in a running session that takes longer than this is logged as
 /// a warning.
 const SLOW_MAT_SEARCH: Duration = Duration::from_secs(3);
@@ -249,6 +259,23 @@ impl ExPutt {
         let ip = self.ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let started = connecting(ctx, ip);
         self.open(ctx, stream, ip, None, started, |_| {})
+    }
+
+    /// Wait out what is left of [`CLOSE_GRACE`] if a session was closed just
+    /// before this connect.
+    fn wait_out_close_grace(&self, ctx: &mut ConnectCtx<'_>) -> Result<(), Error> {
+        if let Some(left) = self.memory.take_grace(ctx.now(), CLOSE_GRACE) {
+            ctx.out.phase("connecting");
+            ctx.out.log(
+                Level::Info,
+                format!(
+                    "waiting {:.1}s after closing the last session",
+                    left.as_secs_f32()
+                ),
+            );
+            ctx.wait(left)?;
+        }
+        Ok(())
     }
 
     /// Open the TCP connection to the device at `ip`.
@@ -346,6 +373,9 @@ impl ExPutt {
             watchdog: Watchdog::new(SILENCE, now),
             gate: ResyncGate::new(RESYNC_GAP, hand, now),
             idle: Idle::new(IDLE_AFTER, now),
+            memory: self.memory.clone(),
+            now,
+            failed: false,
             has_mat: false,
             device_state: None,
             silent: false,
@@ -404,6 +434,7 @@ impl FrpDriver for ExPutt {
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ExPuttSession<TcpStream>, Error> {
         ctx.tick()?;
+        self.wait_out_close_grace(ctx)?;
         // The address to use: the configured one, else the last device's,
         // else what discovery finds. A device that no longer answers at the
         // remembered address is looked for on the network.
@@ -460,7 +491,15 @@ impl FrpDriver for ExPutt {
         } else if matches!(error, Error::Device(crate::Error::Timeout(_))) {
             tell_not_answering = self.unanswered.no_answer(ended.now);
         }
-        if !self.unanswered.told {
+        // The attempt that followed a close the host ended is the device's
+        // to be slow with: no alert for it.
+        let graced = self.memory.take_graced() && ended.connected_for.is_none();
+        if graced {
+            out.log(
+                Level::Info,
+                format!("connect after closing the last session failed: {error}"),
+            );
+        } else if !self.unanswered.told {
             out.alert(Severity::Warn, format!("ExPutt error: {error}"));
         }
         if tell_not_answering {
@@ -484,6 +523,9 @@ impl FrpDriver for ExPutt {
 
 /// A measuring session with the ExPutt over the stream `S` (TCP from
 /// [`connect`](FrpDriver::connect)). See the [module docs](self).
+// The flags are independent facts of the session (mat, silence, a pending log
+// line, a failed step), not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExPuttSession<S> {
     client: Client<S>,
     /// Ends the stream's connection at close.
@@ -493,6 +535,11 @@ pub struct ExPuttSession<S> {
     watchdog: Watchdog,
     gate: ResyncGate,
     idle: Idle,
+    memory: Memory,
+    /// The `now` of the last step.
+    now: Instant,
+    /// A step failed: the session ends on its own, not by its host.
+    failed: bool,
     /// The device has a mat: its search found one, or it reported a putt.
     /// False from the start of a mat search; the status also depends on a
     /// waiting mat search and on silence.
@@ -744,15 +791,11 @@ impl<S: Read + Write> ExPuttSession<S> {
             }
         }
     }
-}
-
-impl<S: Read + Write> FrpSession for ExPuttSession<S> {
-    type Error = Error;
-    type Action = Action;
 
     /// One pass: a mat search that is due, then at most one device event
-    /// (`Activity::Active`), or the watchdog when none is waiting (`Activity::Idle`).
-    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+    /// (`Activity::Active`), or the watchdog when none is waiting
+    /// (`Activity::Idle`).
+    fn advance(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.client
             .record(out.wants_raw() || out.enabled(Level::Trace));
         if std::mem::take(&mut self.hold_to_log) {
@@ -811,6 +854,20 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
         self.handle(out, event, now);
         Ok(Activity::Active)
     }
+}
+
+impl<S: Read + Write> FrpSession for ExPuttSession<S> {
+    type Error = Error;
+    type Action = Action;
+
+    /// One pass: a mat search that is due, then at most one device event
+    /// (`Activity::Active`), or the watchdog when none is waiting (`Activity::Idle`).
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+        self.now = now;
+        let stepped = self.advance(now, out);
+        self.failed |= stepped.is_err();
+        stepped
+    }
 
     /// Follow the golfer's handedness: a new round when it differs from the
     /// device's hand, which finds the mat first, so the device is not armed
@@ -848,6 +905,9 @@ impl<S: Read + Write> FrpSession for ExPuttSession<S> {
             out.log(Level::Debug, "mat search request dropped at shutdown");
         }
         out.log(Level::Info, "closing the session");
+        if !self.failed {
+            self.memory.closed(self.now);
+        }
         if let Err(e) = self.client.close() {
             out.log(Level::Debug, format!("session close: {e}"));
         }

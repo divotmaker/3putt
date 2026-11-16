@@ -674,6 +674,68 @@ fn an_idle_session_finds_the_mat_to_keep_the_device_awake() {
     assert_eq!(requests(&device, before), Vec::<String>::new());
 }
 
+/// The connect after a close the host ended waits out the grace, once; the
+/// attempt's failure is no alert. A session that failed and a connect with no
+/// close before it wait for nothing.
+#[test]
+fn a_connect_after_the_hosts_close_waits_and_its_failure_raises_no_alert() {
+    let mut host = TestHost::new();
+    let mut driver = driver();
+    let waited = |host: &mut TestHost, driver: &mut ExPutt| {
+        let before = host.now();
+        host.connect_with(|ctx| driver.wait_out_close_grace(ctx))
+            .expect("wait");
+        host.now() - before
+    };
+    assert_eq!(
+        waited(&mut host, &mut driver),
+        Duration::ZERO,
+        "first start"
+    );
+
+    let (s, _device) = measuring(&mut host, &mut driver);
+    host.advance(Duration::from_secs(1));
+    host.with(|_, out| s.close(out));
+    host.take();
+    assert_eq!(
+        waited(&mut host, &mut driver),
+        CLOSE_GRACE.saturating_sub(Duration::from_secs(1))
+    );
+    assert!(logged(
+        &host.take(),
+        Level::Info,
+        "waiting 2.0s after closing the last session"
+    ));
+    assert_eq!(waited(&mut host, &mut driver), Duration::ZERO, "once");
+
+    // The attempt after the wait fails: told in the log, not as an alert;
+    // the next failure alerts.
+    let mut backoff = Backoff::default();
+    let error = Error::Device(crate::Error::Timeout("the device's handshake reply"));
+    let mut attempt = |host: &mut TestHost, driver: &mut ExPutt| {
+        host.with(|now, out| {
+            driver.retry_delay(&SessionEnd::new(&error, now, None, 1), &mut backoff, out)
+        });
+        host.take()
+    };
+    let seen = attempt(&mut host, &mut driver);
+    assert_eq!(alert_messages(&seen), Vec::<String>::new());
+    assert!(logged(
+        &seen,
+        Level::Info,
+        "connect after closing the last session failed"
+    ));
+    assert_eq!(alert_messages(&attempt(&mut host, &mut driver)).len(), 1);
+
+    // A session that failed is not a close the host ended.
+    let (mut s, device) = measuring(&mut host, &mut driver);
+    device.disconnect();
+    host.run_for(Duration::from_secs(1), |now, out| s.step(now, out))
+        .unwrap_err();
+    host.with(|_, out| s.close(out));
+    assert_eq!(waited(&mut host, &mut driver), Duration::ZERO);
+}
+
 /// Each failed attempt alerts, until two minutes of unanswered attempts:
 /// then one "not answering" alert, and quiet until a session succeeds.
 #[test]

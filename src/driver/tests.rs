@@ -203,6 +203,29 @@ fn mat_searches_are_spaced_and_coalesced() {
 }
 
 #[test]
+fn the_grace_after_a_close_is_waited_out_once() {
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    let grace = Duration::from_secs(3);
+    let memory = Memory::default();
+    assert_eq!(memory.take_grace(at(0), grace), None, "no close yet");
+
+    memory.closed(at(10));
+    assert_eq!(
+        memory.take_grace(at(11), grace),
+        Some(Duration::from_secs(2))
+    );
+    assert!(memory.take_graced());
+    assert!(!memory.take_graced(), "asking ends it");
+    assert_eq!(memory.take_grace(at(11), grace), None, "once");
+
+    // A connect after the grace has passed waits for nothing.
+    memory.closed(at(20));
+    assert_eq!(memory.take_grace(at(23), grace), None);
+    assert!(!memory.take_graced());
+}
+
+#[test]
 fn a_session_is_idle_after_five_minutes_without_a_putt_or_mat_search() {
     let t0 = Instant::now();
     let at = |s: u64| t0 + Duration::from_secs(s);

@@ -35,6 +35,11 @@ pub(super) struct Memory(Arc<Mutex<Remembered>>);
 struct Remembered {
     /// The address of the last device a session was set up with.
     address: Option<IpAddr>,
+    /// When the last session that its host ended (not one that failed) was
+    /// closed, until the next connect has waited out its grace.
+    closed: Option<Instant>,
+    /// The connect that waited out the grace has not ended yet.
+    graced: bool,
 }
 
 impl Memory {
@@ -58,6 +63,29 @@ impl Memory {
 
     pub(super) fn set_address(&self, ip: IpAddr) {
         self.lock().address = Some(ip);
+    }
+
+    /// A session the host ended was closed at `now`.
+    pub(super) fn closed(&self, now: Instant) {
+        self.lock().closed = Some(now);
+    }
+
+    /// How much of `grace` after the last close a connect starting at `now`
+    /// still waits, once: `None` when there was no close, or `grace` has
+    /// passed.
+    pub(super) fn take_grace(&self, now: Instant, grace: Duration) -> Option<Duration> {
+        let mut memory = self.lock();
+        let closed = memory.closed.take()?;
+        let left = grace
+            .checked_sub(now.saturating_duration_since(closed))
+            .filter(|left| !left.is_zero())?;
+        memory.graced = true;
+        Some(left)
+    }
+
+    /// Whether the connect that ended now waited out a grace; asking ends it.
+    pub(super) fn take_graced(&self) -> bool {
+        std::mem::take(&mut self.lock().graced)
     }
 }
 
