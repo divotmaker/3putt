@@ -27,7 +27,7 @@
 //! - **`testing`**: `testing`, an in-memory device for stepped tests, and
 //!   sample putts.
 //!
-//! Reverse engineered for interoperability under DMCA §1201(f). No licensing is
+//! Built for interoperability under DMCA §1201(f). No licensing is
 //! circumvented, no proprietary code is reproduced, and no features are unlocked.
 //!
 //! # Example

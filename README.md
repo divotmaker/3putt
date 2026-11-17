@@ -12,23 +12,19 @@ ExPutt and ExPutt RG are trademarks of Invant Inc.
 ## Description
 
 Rust client library (crate `threeputt`) for the ExPutt RG putting device over
-WiFi. It talks to the device the way the device's mobile app does and delivers
-each measured putt (launch direction, ball speed, and putter path and face
+WiFi. It delivers each measured putt (launch direction, ball speed, and putter path and face
 angle when the putter is tracked) to your program. The device reports ball
 speed and direction only; distance is left to the consumer (for example a
 simulator).
 
-- **`discover`** waits for the device's UDP beacon, or connect straight to a
-  known IP.
-- **`Session`** connects, runs the setup (handshake, mat sync, putting hand,
-  start measuring), sends keepalives, and delivers `Event`s over a channel.
-  `Session::find_mat` locates the mat again on a live session, without
-  reconnecting. Every new round, including a hand change
-  (`Session::restart_match`), locates the mat again too.
-- **`Connection`** is the lower layer: send a `Request`, receive an `Event`.
+- **`Client`** runs a session over a non-blocking stream (the device's TCP
+  port, set non-blocking): the handshake, the mat search, keepalives, putts
+  as `Event`s, new rounds (`Client::find_mat`, `Client::restart_match`,
+  which locate the mat again) and the goodbye. Each `poll_at(now)` does what
+  is due at the time it is given.
+- **`Beacon::parse`** reads the device's discovery broadcast.
 
-Plain blocking `std::net` sockets and threads. No async runtime, no ZeroMQ
-library.
+No threads, no blocking calls, no async runtime, no ZeroMQ library.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -59,16 +55,13 @@ This project is an exercise of the interoperability exception under
 The ExPutt RG uses a proprietary protocol over WiFi to communicate putt data
 (ball speed, launch direction, putter path and face angle, etc.) to its mobile
 app. Invant does not publish this protocol or provide an SDK for third-party
-integration. The protocol was worked out from WiFi traffic between the
-researcher's own lawfully purchased device and the official ExPutt app, and
-from analysis of that app, solely to enable interoperability with third-party
-golf simulation software.
+integration. This project exists solely to enable interoperability with
+third-party golf simulation software.
 
 No Invant code is reproduced here; the protocol is described and implemented in
-our own words and names. No access controls were circumvented — the device
+our own words and names. No access controls are circumvented — the device
 accepts unencrypted connections on the local network and its session handshake
-carries no secret, and all traffic was captured from the researcher's own
-hardware.
+carries no secret.
 
 ## Acceptable Use
 
@@ -95,31 +88,35 @@ at your option.
 
 ## Status
 
-**Beta** (`0.0.x`). Verified against one ExPutt RG (device software
+**Beta** (`0.x`). Verified against one ExPutt RG (device software
 1.21.2176). The API may change between releases. Several values in a putt
 result are not yet identified; see the table below.
 
 ## Quick start
 
 Put the device in mobile mode (from its TV login screen) and join the same
-network, then:
+network, then, with its IP address (the device's beacon carries it;
+[`examples/monitor.rs`](examples/monitor.rs) shows a listener):
 
 ```rust,no_run
+use std::net::TcpStream;
 use std::time::Duration;
-use threeputt::{Event, Session, SessionOptions, discover};
+use threeputt::{Client, DEVICE_PORT, Event, Hand};
 
 fn main() -> threeputt::Result<()> {
-    let beacon = discover(Duration::from_secs(30))?;
-    let session = Session::start(beacon.ip, &SessionOptions::default())?;
-    for event in session.events() {
-        if let Event::PuttResult(putt) = event {
-            println!(
-                "{:+.1}°, {:.2} m/s",
-                putt.launch_direction_deg, putt.ball_speed_mps
-            );
+    let stream = TcpStream::connect(("192.168.1.40", DEVICE_PORT))?;
+    stream.set_nonblocking(true)?;
+    let mut client = Client::new(stream, Hand::Right);
+    loop {
+        match client.poll()? {
+            Some(Event::PuttResult(putt)) => println!(
+                "{:.2} m/s, {:+.1} deg",
+                putt.ball_speed_mps, putt.launch_direction_deg
+            ),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    Ok(())
 }
 ```
 
@@ -130,19 +127,20 @@ cargo run --example monitor -- [--ip IP] [--left] [--frames DIR]
 ```
 
 `--frames DIR` saves the camera images the device streams while it locates
-the mat (`SessionOptions::camera`; without it the session still starts and
+the mat (`Client::set_camera`; without it the session still starts and
 stops the stream but drops the frames). The images are upside down; rotate
 them 180° to view. Ctrl-C ends the session cleanly.
 
 ## Features
 
+No feature is on by default.
+
 | Feature | Adds |
 |---|---|
-| `net` (default) | `discover` (the UDP beacon socket, via `socket2`); a build with `default-features = false` that calls `discover` turns `net` on |
 | `config` | `threeputt::config::Config`, the driver's settings, with no network code: it builds for `wasm32-unknown-unknown` with `--no-default-features --features config` |
-| `driver` | `threeputt::driver::ExPutt`, a [flightrelay](https://crates.io/crates/flightrelay) `FrpDriver` |
+| `driver` | `threeputt::driver::ExPutt`, a [flightrelay](https://crates.io/crates/flightrelay) `FrpDriver`, with discovery (the UDP beacon socket, via `socket2`) |
 | `frp` | the `threeputt-frp` binary |
-| `testing` | `threeputt::testing::MockDevice`, and the driver's ports and session timings (`Tuning`) |
+| `testing` | `threeputt::testing::FakeDevice`, an in-memory device for stepped tests, and sample putts |
 
 ## FRP driver and `threeputt-frp` (beta)
 
@@ -161,7 +159,10 @@ threeputt-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>] \
 - `--target`: an address to listen on (default `0.0.0.0:5880`), or a `ws://`
   URL of a hub to dial.
 - `--set address=192.168.1.40`: the device's IP address. Without it the
-  device is found by its discovery beacon. `--config` takes a TOML file with
+  device is found by its discovery beacon. Setting the address makes
+  reconnects dependable: a device that has had a client stops broadcasting.
+  Without it the driver tries the last device's address first and falls back
+  to discovery. `--config` takes a TOML file with
   the same keys (`address = "192.168.1.40"`), and the runner's own settings
   in an `[frp]` table: `actor_id` (the actor's id on the bus, generated and
   written into the file on the first run so it stays the same across
@@ -175,11 +176,15 @@ What goes on the bus:
 
 - The actor's `bus.actor`: a `device` block with model `ExPutt RG`,
   `source` `measured` and the device software version as `firmware` when the
-  device was discovered; the `not_armed` blocker whenever the device is not
-  ready for a putt (no blockers when it is); and the telemetry key
-  `device_state` (`finding mat`, `mat found`, `ready`, `ball struck`).
-- Per putt: `shot.trigger` (with the strike time when the device reported
-  the strike), `shot.launch` with ball speed and launch direction (no
+  device was discovered; the `not_armed` blocker while there is no mat (none
+  found yet, or a mat search is running or waiting) or the device is silent
+  (no blockers otherwise; putting never sets it); and the telemetry key
+  `device_state` (`finding mat`, `mat found`, `ready`, `ball detected`;
+  `unknown` until the device names a state). `device_state` reads
+  `ball detected` from a ball being set down to the putt's result, then
+  `ready`.
+- Per putt: `shot.trigger` (no timestamp: the device does not report the
+  stroke), `shot.launch` with ball speed and launch direction (no
   vertical launch and no spin: the device measures neither), `shot.club`
   with putter path and face angle when the putter was tracked, and
   `shot.finished`.
@@ -196,16 +201,21 @@ step handles at most one device message, and every timer below runs on that
 `now`.
 
 The driver gives a device that stops answering time to recover: a session may
-be silent for 90 s (120 s after a strike) and it reports `not_armed` from
+be silent for 90 s (120 s while a ball is detected) and it reports `not_armed` from
 10 s of silence; after a silent device the next attempt waits at least 15 s; mat
 searches (a hand change, Find mat) are at least 10 s apart, with requests in
-between folded into one. After two minutes of attempts the device accepts but
-never answers, one `bus.alert` says so and the per-attempt alerts stop until a
-session succeeds.
+between folded into one. After two minutes of failed attempts (the device
+turned off, out of reach or not answering), one `bus.alert` says so and the
+per-attempt alerts stop until a session succeeds. A session with no putt and
+no mat search for 5 minutes runs a mat search by itself, because an idle
+device stops detecting putts. The first connect after a session its host
+ended (a reconnect, a card turned off and on) waits until 3 s have passed
+since the close, and its failure raises no alert.
 
-A stop during a session start can take up to 18 s: the connect, greeting,
-handshake and mat search can't be cut short (3 s, 3 s, 2 × 3 s and 5 s, plus a
-second to close).
+A stop ends a connect at once: discovery, the TCP connect and the handshake
+check for one on every pass. The session's mat search runs in its first step.
+Closing says goodbye and waits at most half a second for the device to hang
+up.
 
 ## Putt result
 
@@ -230,11 +240,12 @@ the same putt. All 16 values are always available in `raw`.
 
 | Device comment | `Event` |
 |---|---|
+| `N_OK` | `Ack` |
 | `Test` | `Heartbeat` (about once a second) |
 | `FindMat` | `FindingMat` |
 | `MatOK` | `MatFound` |
 | `PuttReady` | `PuttReady` |
-| `PuttShot` | `BallStruck` (can fire without a putt following) |
+| `PuttShot` | `BallDetected` (a ball set down on the mat; can fire without a putt following) |
 | `IndiCator` / `IndiCatorOut` | `Indicator` / `IndicatorOut` |
 | `PuttResult` | `PuttResult` |
 | camera image | `CameraFrame` (JPEG bytes) |
@@ -260,6 +271,6 @@ Unrecognized packets are never errors.
 
 ## Testing
 
-The `testing` feature adds `threeputt::testing::MockDevice`, an in-process
-mock device on a local TCP port, plus sample putt results, for testing code
-built on this crate without hardware.
+The `testing` feature adds `threeputt::testing::FakeDevice`, an in-memory
+device a test steps itself (no sockets, no threads), plus sample putt results,
+for testing code built on this crate without hardware.
